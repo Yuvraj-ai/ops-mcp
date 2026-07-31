@@ -105,25 +105,39 @@ export function buildToolDefinitions(repo: OpsRepository) {
             "Must be explicitly true. Only set this after the human operator has approved this exact action."
           ),
       },
-      handler: async (input: { order_id: string; confirmed_by_operator: true }) => {
-        const order = await repo.getOrder(input.order_id);
-        if (!order) return { error: `No order found with ID ${input.order_id}.` };
-        if (order.status === "refunded" || order.status === "cancelled") {
-          return { error: `Order ${input.order_id} is '${order.status}' and cannot be reconfirmed.` };
-        }
-        if (order.status !== "failed") {
-          return {
-            error: `Order ${input.order_id} has status '${order.status}', not 'failed'. Reconfirm is only valid for failed orders. Re-investigate before acting.`,
-          };
-        }
-        const result = await repo.reconfirmOrder(input.order_id);
-        return {
-          success: true,
-          new_order_status: "confirmed",
-          new_hold_id: result.newHoldId,
-          note: "Call get_shipment_status next to verify fulfillment picked this up.",
-        };
-      },
+       handler: async (input: { order_id: string; confirmed_by_operator: true }) => {
+         let result: any;
+         try {
+           const order = await repo.getOrder(input.order_id);
+           if (!order) {
+             result = { error: `No order found with ID ${input.order_id}.` };
+           } else if (order.status === "refunded" || order.status === "cancelled") {
+             result = { error: `Order ${input.order_id} is '${order.status}' and cannot be reconfirmed.` };
+           } else if (order.status !== "failed") {
+             result = {
+               error: `Order ${input.order_id} has status '${order.status}', not 'failed'. Re-investigate before acting.`,
+             };
+           } else {
+             const r = await repo.reconfirmOrder(input.order_id);
+             result = {
+               success: true,
+               new_order_status: "confirmed",
+               new_hold_id: r.newHoldId,
+               note: "Call get_shipment_status next to verify fulfillment picked this up.",
+             };
+           }
+         } catch (err) {
+           result = { error: err instanceof Error ? err.message : String(err) };
+         }
+         await repo.logAction({
+           order_id: input.order_id,
+           tool_name: "reconfirm_order",
+           input_json: JSON.stringify(input),
+           result_json: JSON.stringify(result),
+           success: !("error" in result),
+         });
+         return result;
+       },
     },
     {
       name: "issue_refund",
@@ -143,31 +157,47 @@ export function buildToolDefinitions(repo: OpsRepository) {
             "Must be explicitly true. Only set this after the human operator has approved this exact refund."
           ),
       },
-      handler: async (input: {
-        order_id: string;
-        amount: number;
-        reason: string;
-        confirmed_by_operator: true;
-      }) => {
-        const order = await repo.getOrder(input.order_id);
-        if (!order) return { error: `No order found with ID ${input.order_id}.` };
-        if (order.status === "refunded") {
-          return { error: `Order ${input.order_id} has already been refunded.` };
-        }
-        const payment = await repo.getPaymentByOrder(input.order_id);
-        if (!payment || payment.status !== "captured") {
-          return {
-            error: `Order ${input.order_id} has no captured payment to refund (payment status: ${payment?.status ?? "none"}).`,
-          };
-        }
-        const result = await repo.issueRefund(input.order_id);
-        return {
-          success: true,
-          refund_id: result.refundId,
-          new_order_status: "refunded",
-          reason: input.reason,
-        };
-      },
+       handler: async (input: {
+         order_id: string;
+         amount: number;
+         reason: string;
+         confirmed_by_operator: true;
+       }) => {
+         let result: any;
+         try {
+           const order = await repo.getOrder(input.order_id);
+           if (!order) {
+             result = { error: `No order found with ID ${input.order_id}.` };
+           } else if (order.status === "refunded") {
+             result = { error: `Order ${input.order_id} has already been refunded.` };
+           } else {
+             const payment = await repo.getPaymentByOrder(input.order_id);
+             if (!payment || payment.status !== "captured") {
+               result = {
+                 error: `Order ${input.order_id} has no captured payment to refund (payment status: ${payment?.status ?? "none"}).`,
+               };
+             } else {
+               const r = await repo.issueRefund(input.order_id);
+               result = {
+                 success: true,
+                 refund_id: r.refundId,
+                 new_order_status: "refunded",
+                 reason: input.reason,
+               };
+             }
+           }
+         } catch (err) {
+           result = { error: err instanceof Error ? err.message : String(err) };
+         }
+         await repo.logAction({
+           order_id: input.order_id,
+           tool_name: "issue_refund",
+           input_json: JSON.stringify(input),
+           result_json: JSON.stringify(result),
+           success: !("error" in result),
+         });
+         return result;
+       },
     },
   ];
 }

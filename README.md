@@ -40,6 +40,13 @@ orders (A1023 = reconfirm path, A1024 = refund path), and three deliberate
 edge cases (an already-refunded order, a cancelled order, and a "decoy"
 order that looks similar but isn't actually broken).
 
+> **Supabase pooler:** If your DB host only has IPv6 DNS (Supabase's direct
+> `db.[ref].supabase.co` endpoint), use the Supabase **Connection Pooler**
+> endpoint instead — it resolves to IPv4 and works from any hosting
+> environment. Get it from the Supabase dashboard under Database →
+> Connection Pooling. Format:
+> `postgresql://postgres.[ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres`
+
 ## MCP tools
 
 Read (freely callable, no side effects):
@@ -98,6 +105,14 @@ npm start          # runs dist/server.js, respects $PORT
 ```
 
 Remember to set `DATABASE_URL` in your deployment environment.
+
+**Platform notes:**
+- **Render / Railway / Fly / Heroku** — Ideal. These run a persistent process;
+  just set `DATABASE_URL` (to the Supabase pooler connection string) and
+  deploy. These are recommended.
+- **Vercel** — Not recommended. Vercel uses serverless functions with cold
+  starts and timeouts (10–15s). MCP over Streamable HTTP works but will be
+  unreliable for longer-running operations. Use Render or Railway instead.
 
 ## Connecting an MCP client
 

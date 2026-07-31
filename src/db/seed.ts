@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { Pool } from "pg";
 import { initDatabase } from "./schema.js";
 
@@ -195,7 +196,11 @@ if (__filename === process.argv[1]) {
   if (!databaseUrl) {
     throw new Error("DATABASE_URL environment variable is required");
   }
-  const pool = new Pool({ connectionString: databaseUrl });
+   const config: ConstructorParameters<typeof Pool>[0] = { connectionString: databaseUrl };
+   if (databaseUrl.includes("supabase.co") || databaseUrl.includes("pooler.supabase.com")) {
+     config.ssl = { rejectUnauthorized: false };
+   }
+   const pool = new Pool(config);
   initDatabase(pool)
     .then(() => seedDatabase(pool))
     .then(() => {

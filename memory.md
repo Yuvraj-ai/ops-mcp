@@ -6,6 +6,7 @@
 2. **Implementation policy**: Every implementation MUST be unit tested before moving to the next task
 3. **Knowledge capture**: Add important findings, patterns, and lessons learned as they are discovered
 4. **Handoff.md is source of truth**: All architecture, decisions, and pending work live in `docs/handoff.md`
+5. **Do not start new tasks without explicit user approval** — user must confirm before proceeding with any new task from the pending changes list
 
 ## Current Project Context
 
@@ -43,13 +44,14 @@ SQLite/PostgreSQL (src/db/schema.ts)
 ## Pending Changes (from handoff.md)
 
 1. [x] Migrate from in-memory SQLite to hosted PostgreSQL — DONE: `pg` driver, `pg-mem` for tests, schema.sql DDL, seed.ts standalone script, all async. Tests pass 14/14.
-2. [ ] Add audit log (`action_log` table: id, order_id, tool_name, input_json, result_json, success, performed_at)
-3. [ ] Add true idempotency via agent-generated key (Option A — locked)
-4. [ ] Fix oversell race condition in `reconfirm_order` (atomic conditional UPDATE)
-5. [ ] Audit hold/stock mutations are correctly scoped by order_id/hold id
-6. [x] Re-run full verification suite against Postgres-backed version — DONE: 14/14 tests pass with pg-mem
-7. [x] Update README for Postgres setup — DONE
-8. [ ] Deployment (Render/Railway/Fly)
+2. [x] Deploy schema + seed to live Supabase — DONE: ap-southeast-2 pooler endpoint, all 10 orders + 5 stock items verified. End-to-end test passes.
+3. [x] Add audit log (`action_log` table) — DONE: table in schema.sql, `logAction()` in OpsRepository, both write handlers wrapped. 17/17 tests pass + verified against live Supabase.
+4. [ ] Add true idempotency via agent-generated key (Option A — locked)
+5. [ ] Fix oversell race condition in `reconfirm_order` (atomic conditional UPDATE)
+6. [ ] Audit hold/stock mutations are correctly scoped by order_id/hold id
+7. [x] Re-run full verification suite — DONE: 17/17 pg-mem tests + live Supabase e2e test both pass
+8. [x] Update README for Postgres setup — DONE: pooler guidance, platform notes (Heroku/Render/Vercel)
+9. [~] Deployment — Infrastructure ready (.env with pooler connection string); hosting platform deployment awaiting user approval
 
 ## Seed Data Reference
 
@@ -66,11 +68,12 @@ SQLite/PostgreSQL (src/db/schema.ts)
 ## Decisions Log (Key Rationale)
 
 1. In-memory SQLite → hosted PostgreSQL (client requirement: persisted audit history)
-2. Explicit `confirmed_by_operator: true` flag (safety mechanism, not just model judgment)
-3. No `search_orders` tool (workflow always starts from known order ID)
-4. Stateless MCP transport (simpler hosting, no sticky sessions needed)
-5. Idempotency: agent-generated key, server replays stored result on match (Stripe/PayPal pattern)
-6. Oversell protection: atomic conditional UPDATE, not separate check-then-write
+2. Supabase pooler endpoint for IPv4 accessibility — direct DB host is IPv6-only, pooler resolves to IPv4
+3. SSL with `rejectUnauthorized: false` for Supabase connections (pooler uses self-signed certs)
+4. Explicit `confirmed_by_operator: true` flag (safety mechanism, not just model judgment)
+5. No `search_orders` tool (workflow always starts from known order ID)
+6. Idempotency: agent-generated key, server replays stored result on match (Stripe/PayPal pattern)
+7. Oversell protection: atomic conditional UPDATE, not separate check-then-write
 
 ## Test Status
 
@@ -78,6 +81,7 @@ SQLite/PostgreSQL (src/db/schema.ts)
 - All 5 read tools verified
 - Full diagnostic chain on A1023 verified
 - Safety rejections verified (refunded order, no captured payment, decoy order)
+- End-to-end live integration test against Supabase PostgreSQL passes (reconfirm → shipment verify)
 
 ## TODO
 

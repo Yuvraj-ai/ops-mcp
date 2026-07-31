@@ -39,3 +39,15 @@ CREATE TABLE IF NOT EXISTS shipments (
   carrier    TEXT,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS action_log (
+  id          BIGSERIAL PRIMARY KEY,
+  order_id    TEXT,
+  tool_name   TEXT NOT NULL,
+  input_json  TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  success     BOOLEAN NOT NULL,
+  performed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS action_log_order_id_idx ON action_log(order_id, performed_at DESC);

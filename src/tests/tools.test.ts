@@ -30,6 +30,7 @@ function check(label: string, condition: boolean) {
 
 async function resetDatabase(pool: Pool): Promise<void> {
   await pool.query(`
+    DROP TABLE IF EXISTS action_log;
     DROP TABLE IF EXISTS shipments;
     DROP TABLE IF EXISTS inventory_holds;
     DROP TABLE IF EXISTS inventory_stock;
@@ -116,6 +117,20 @@ async function run() {
 
   const rejectUnknown = await byName.get_order_details.handler({ order_id: "A9999" }) as any;
   check("lookup on unknown order returns a clear error, not a crash", !!rejectUnknown.error);
+
+  // === Audit log ===
+  console.log("\n== Audit log verification ==");
+  const auditRows = await pool.query(
+    "SELECT order_id, tool_name, success FROM action_log ORDER BY id"
+  );
+  const reconfirmAudit = auditRows.rows.find(r => r.tool_name === "reconfirm_order" && r.order_id === "A1023");
+  check("audit log records reconfirm_order for A1023 as success", reconfirmAudit?.success === true);
+
+  const refundAudit = auditRows.rows.find(r => r.tool_name === "issue_refund" && r.order_id === "A1024");
+  check("audit log records issue_refund for A1024 as success", refundAudit?.success === true);
+
+  const rejectedAudit = auditRows.rows.find(r => r.tool_name === "reconfirm_order" && r.order_id === "A1025");
+  check("audit log records rejected reconfirm on A1025 as failure", rejectedAudit?.success === false);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();

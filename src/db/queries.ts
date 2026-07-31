@@ -39,6 +39,24 @@ export interface ShipmentRow {
 export class OpsRepository {
   constructor(private pool: Pool) {}
 
+  async logAction(params: {
+    order_id: string | null;
+    tool_name: string;
+    input_json: string;
+    result_json: string;
+    success: boolean;
+  }): Promise<void> {
+    try {
+      await this.pool.query(
+        `INSERT INTO action_log (order_id, tool_name, input_json, result_json, success)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [params.order_id, params.tool_name, params.input_json, params.result_json, params.success]
+      );
+    } catch (err) {
+      console.error("Failed to write audit log:", err);
+    }
+  }
+
   async getOrder(orderId: string): Promise<OrderRow | undefined> {
     const result = await this.pool.query("SELECT * FROM orders WHERE id = $1", [orderId]);
     return result.rows[0] as OrderRow | undefined;

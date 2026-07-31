@@ -5,7 +5,11 @@ import { Pool } from "pg";
 export const DATABASE_URL = process.env.DATABASE_URL || "";
 
 export function createPool(): Pool {
-  return new Pool({ connectionString: DATABASE_URL });
+  const config: ConstructorParameters<typeof Pool>[0] = { connectionString: DATABASE_URL };
+  if (DATABASE_URL.includes("supabase.co") || DATABASE_URL.includes("pooler.supabase.com")) {
+    config.ssl = { rejectUnauthorized: false };
+  }
+  return new Pool(config);
 }
 
 export async function initDatabase(pool: Pool): Promise<void> {
