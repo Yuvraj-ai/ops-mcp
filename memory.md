@@ -45,11 +45,11 @@ SQLite/PostgreSQL (src/db/schema.ts)
 
 1. [x] Migrate from in-memory SQLite to hosted PostgreSQL — DONE: `pg` driver, `pg-mem` for tests, schema.sql DDL, seed.ts standalone script, all async. Tests pass 14/14.
 2. [x] Deploy schema + seed to live Supabase — DONE: ap-southeast-2 pooler endpoint, all 10 orders + 5 stock items verified. End-to-end test passes.
-3. [x] Add audit log (`action_log` table) — DONE: table in schema.sql, `logAction()` in OpsRepository, both write handlers wrapped. 20/20 tests pass + verified against live Supabase.
-4. [ ] Add true idempotency via agent-generated key (Option A — locked)
-5. [x] Fix oversell race condition in `reconfirm_order` (atomic conditional UPDATE) — DONE: `available_qty >= $1` guard, 0 rows → throw → ROLLBACK. 20/20 tests pass + verified against live Supabase.
+3. [x] Add audit log (`action_log` table) — DONE: table in schema.sql, `logAction()` in OpsRepository, both write handlers wrapped. 24/24 tests pass + verified against live Supabase.
+4. [x] Add true idempotency via agent-generated key (Option A — locked) — DONE: `idempotency_keys` table (composite PK), both write tools require UUID `idempotency_key`, replay on duplicate key. Best-effort. 24/24 tests pass + verified against live Supabase.
+5. [x] Fix oversell race condition in `reconfirm_order` (atomic conditional UPDATE) — DONE: `available_qty >= $1` guard, 0 rows → throw → ROLLBACK. 24/24 tests pass + verified against live Supabase.
 6. [x] Audit hold/stock mutations — DONE: all mutations scoped by order_id or specific hold id.
-7. [x] Re-run full verification suite — DONE: 20/20 pg-mem tests + live Supabase e2e test both pass.
+7. [x] Re-run full verification suite — DONE: 24/24 pg-mem tests + live Supabase e2e test both pass.
 8. [x] Update README for Postgres setup — DONE: pooler guidance, platform notes (Heroku/Render/Vercel)
 9. [~] Deployment — Infrastructure ready (`.env` with pooler connection string); hosting platform deployment awaiting user approval
 

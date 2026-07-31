@@ -30,6 +30,7 @@ function check(label: string, condition: boolean) {
 
 async function resetDatabase(pool: Pool): Promise<void> {
   await pool.query(`
+    DROP TABLE IF EXISTS idempotency_keys;
     DROP TABLE IF EXISTS action_log;
     DROP TABLE IF EXISTS shipments;
     DROP TABLE IF EXISTS inventory_holds;
@@ -67,6 +68,7 @@ async function run() {
 
   const reconfirm = await byName.reconfirm_order.handler({
     order_id: "A1023",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440000",
     confirmed_by_operator: true,
   }) as any;
   check("reconfirm succeeds", reconfirm.success === true);
@@ -81,6 +83,7 @@ async function run() {
   console.log("\n== Oversell prevention ==");
   const oversellAttempt = await byName.reconfirm_order.handler({
     order_id: "A1024",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440001",
     confirmed_by_operator: true,
   }) as any;
   check("reconfirm rejects out-of-stock order (no oversell)", !!oversellAttempt.error);
@@ -98,6 +101,7 @@ async function run() {
 
   const refund = await byName.issue_refund.handler({
     order_id: "A1024",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440002",
     amount: 1799,
     reason: "Stock unavailable after hold expiry",
     confirmed_by_operator: true,
@@ -111,12 +115,14 @@ async function run() {
   console.log("\n== Safety: rejection cases ==");
   const rejectRefunded = await byName.reconfirm_order.handler({
     order_id: "A1025",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440003",
     confirmed_by_operator: true,
   }) as any;
   check("reconfirm rejects an already-refunded order", !!rejectRefunded.error);
 
   const rejectCancelled = await byName.issue_refund.handler({
     order_id: "A1026",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440004",
     amount: 1299,
     reason: "test",
     confirmed_by_operator: true,
@@ -125,6 +131,7 @@ async function run() {
 
   const rejectDecoy = await byName.reconfirm_order.handler({
     order_id: "A1027",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440005",
     confirmed_by_operator: true,
   }) as any;
   check("reconfirm rejects a non-failed order (decoy)", !!rejectDecoy.error);
@@ -145,6 +152,38 @@ async function run() {
 
   const rejectedAudit = auditRows.rows.find(r => r.tool_name === "reconfirm_order" && r.order_id === "A1025");
   check("audit log records rejected reconfirm on A1025 as failure", rejectedAudit?.success === false);
+
+  // === Idempotency ===
+  console.log("\n== Idempotency verification ==");
+
+  // Use A1004 (confirmed, captured payment) for a successful refund idempotency test
+  const idemKey = "550e8400-e29b-41d4-a716-446655440099";
+  const firstRefund = await byName.issue_refund.handler({
+    order_id: "A1004",
+    idempotency_key: idemKey,
+    amount: 3499,
+    reason: "idempotency test",
+    confirmed_by_operator: true,
+  }) as any;
+  check("first idempotency call succeeds", firstRefund.success === true);
+
+  // Same key — must replay stored result, NOT re-execute (which would fail: A1004 is now "refunded")
+  const secondRefund = await byName.issue_refund.handler({
+    order_id: "A1004",
+    idempotency_key: idemKey,
+    amount: 3499,
+    reason: "idempotency test",
+    confirmed_by_operator: true,
+  }) as any;
+  check("second call with same key replays result (not re-execution)", secondRefund.success === true);
+  check("replayed result matches first call", JSON.stringify(firstRefund) === JSON.stringify(secondRefund));
+
+  // Idempotency keys table should have exactly 1 entry for this key
+  const idemCount = await pool.query(
+    "SELECT COUNT(*) as count FROM idempotency_keys WHERE key = $1",
+    [idemKey]
+  );
+  check("idempotency key stored once", idemCount.rows[0].count === 1);
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();

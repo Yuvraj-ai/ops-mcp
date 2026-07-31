@@ -51,3 +51,11 @@ CREATE TABLE IF NOT EXISTS action_log (
 );
 
 CREATE INDEX IF NOT EXISTS action_log_order_id_idx ON action_log(order_id, performed_at DESC);
+
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  tool_name  TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  result     TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  PRIMARY KEY (tool_name, key)
+);

@@ -57,6 +57,31 @@ export class OpsRepository {
     }
   }
 
+  async getIdempotencyResult(toolName: string, key: string): Promise<any | undefined> {
+    try {
+      const result = await this.pool.query(
+        "SELECT result FROM idempotency_keys WHERE tool_name = $1 AND key = $2",
+        [toolName, key]
+      );
+      if (result.rows.length === 0) return undefined;
+      return JSON.parse(result.rows[0].result);
+    } catch (err) {
+      console.error("Idempotency check failed, proceeding as fresh execution:", err);
+      return undefined;
+    }
+  }
+
+  async storeIdempotencyResult(toolName: string, key: string, result: any): Promise<void> {
+    try {
+      await this.pool.query(
+        "INSERT INTO idempotency_keys (tool_name, key, result) VALUES ($1, $2, $3)",
+        [toolName, key, JSON.stringify(result)]
+      );
+    } catch (err) {
+      console.error("Failed to store idempotency result:", err);
+    }
+  }
+
   async getOrder(orderId: string): Promise<OrderRow | undefined> {
     const result = await this.pool.query("SELECT * FROM orders WHERE id = $1", [orderId]);
     return result.rows[0] as OrderRow | undefined;
