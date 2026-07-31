@@ -118,3 +118,4 @@ Remember to set `DATABASE_URL` in your deployment environment.
 
 Point any MCP-over-HTTP client (Streamable HTTP transport, stateless mode)
 at `POST /mcp` on the deployed URL.
+# ops-mcp
