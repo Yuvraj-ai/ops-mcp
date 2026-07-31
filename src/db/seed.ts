@@ -201,10 +201,19 @@ if (__filename === process.argv[1]) {
      config.ssl = { rejectUnauthorized: false };
    }
    const pool = new Pool(config);
+  const shouldReset = process.argv.includes("--reset");
   initDatabase(pool)
+    .then(() => {
+      if (shouldReset) {
+        console.log("Resetting database (TRUNCATE)...");
+        return pool.query(
+          "TRUNCATE idempotency_keys, action_log, shipments, inventory_holds, inventory_stock, payments, orders RESTART IDENTITY CASCADE"
+        );
+      }
+    })
     .then(() => seedDatabase(pool))
     .then(() => {
-      console.log("Database seeded successfully.");
+      console.log(shouldReset ? "Database reset and seeded successfully." : "Database seeded successfully.");
       pool.end();
     })
     .catch((err) => {

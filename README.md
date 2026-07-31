@@ -75,6 +75,17 @@ cp .env.example .env
 npm run seed  # one-time: creates tables and inserts seed data
 ```
 
+**Default (no flags):** seed data is inserted with `ON CONFLICT DO NOTHING` —
+safe to re-run on a live database; it will **not** overwrite or undo mutations
+an agent may have made (e.g. an order reconfirmed from `failed` to `confirmed`
+stays confirmed).
+
+**To reset demo state** (truncate all tables and re-seed from scratch):
+
+```bash
+npm run seed -- --reset
+```
+
 Then:
 
 ```
