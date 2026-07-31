@@ -89,11 +89,16 @@ export class OpsRepository {
 
     const client = await this.pool.connect();
     try {
-      await client.query("BEGIN");
-      await client.query(
-        "UPDATE inventory_stock SET available_qty = available_qty - $1 WHERE sku = $2",
-        [hold.quantity, hold.sku]
-      );
+       await client.query("BEGIN");
+       const stockUpdate = await client.query(
+         "UPDATE inventory_stock SET available_qty = available_qty - $1 WHERE sku = $2 AND available_qty >= $1",
+         [hold.quantity, hold.sku]
+       );
+       if (stockUpdate.rowCount === 0) {
+         throw new Error(
+           `Insufficient stock for SKU ${hold.sku}: need ${hold.quantity}, not available`
+         );
+       }
       await client.query(
         "INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES ($1, $2, $3, $4, 'active', $5)",
         [newHoldId, orderId, hold.sku, hold.quantity, expiresAt]

@@ -77,6 +77,20 @@ async function run() {
   const shipmentAfter = await byName.get_shipment_status.handler({ order_id: "A1023" }) as any;
   check("shipment record now exists and is pending", shipmentAfter.status === "pending");
 
+  // === Oversell prevention ===
+  console.log("\n== Oversell prevention ==");
+  const oversellAttempt = await byName.reconfirm_order.handler({
+    order_id: "A1024",
+    confirmed_by_operator: true,
+  }) as any;
+  check("reconfirm rejects out-of-stock order (no oversell)", !!oversellAttempt.error);
+
+  const orderAfterReject = await byName.get_order_details.handler({ order_id: "A1024" }) as any;
+  check("order status unchanged after rejected reconfirm", orderAfterReject.status === "failed");
+
+  const stockAfter = await byName.check_stock_availability.handler({ sku: "SKU-101", quantity: 1 }) as any;
+  check("stock not decremented on rejected oversell", stockAfter.available_qty === 0);
+
   // === A1024: refund path ===
   console.log("\n== Scenario: A1024 (stock unavailable -> refund path) ==");
   const stock2 = await byName.check_stock_availability.handler({ sku: "SKU-101", quantity: 1 }) as any;
