@@ -103,7 +103,11 @@ export class OpsRepository {
     return result.rows[0] as ShipmentRow | undefined;
   }
 
-  async reconfirmOrder(orderId: string): Promise<{ newHoldId: string }> {
+  async reconfirmOrder(
+    orderId: string,
+    idempotencyKey: string,
+    inputJson: string
+  ): Promise<{ success: true; new_order_status: string; new_hold_id: string; note: string }> {
     const order = await this.getOrder(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
     const hold = await this.getHoldByOrder(orderId);
@@ -124,35 +128,54 @@ export class OpsRepository {
            `Insufficient stock for SKU ${hold.sku}: need ${hold.quantity}, not available`
          );
        }
-      await client.query(
-        "INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES ($1, $2, $3, $4, 'active', $5)",
-        [newHoldId, orderId, hold.sku, hold.quantity, expiresAt]
-      );
-      await client.query("UPDATE orders SET status = 'confirmed' WHERE id = $1", [orderId]);
+       await client.query(
+          "INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES ($1, $2, $3, $4, 'active', $5)",
+          [newHoldId, orderId, hold.sku, hold.quantity, expiresAt]
+        );
+        await client.query("UPDATE orders SET status = 'confirmed' WHERE id = $1", [orderId]);
 
-      const existingShipment = await this.getShipmentByOrder(orderId);
+        const existingShipment = await this.getShipmentByOrder(orderId);
       if (existingShipment) {
         await client.query(
           "UPDATE shipments SET status = 'pending', updated_at = $1 WHERE order_id = $2",
           [new Date().toISOString(), orderId]
         );
-      } else {
+        } else {
         await client.query(
           "INSERT INTO shipments (id, order_id, status, carrier, updated_at) VALUES ($1, $2, 'pending', NULL, $3)",
           [`S${Date.now()}`, orderId, new Date().toISOString()]
         );
       }
+      const result = {
+        success: true,
+        new_order_status: "confirmed",
+        new_hold_id: newHoldId,
+        note: "Call get_shipment_status next to verify fulfillment picked this up.",
+      } as const;
+      await client.query(
+        "INSERT INTO action_log (order_id, tool_name, input_json, result_json, success) VALUES ($1, $2, $3, $4, $5)",
+        [orderId, "reconfirm_order", inputJson, JSON.stringify(result), true]
+      );
+      await client.query(
+        "INSERT INTO idempotency_keys (tool_name, key, result) VALUES ($1, $2, $3)",
+        ["reconfirm_order", idempotencyKey, JSON.stringify(result)]
+      );
       await client.query("COMMIT");
+      return result;
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
     } finally {
       client.release();
     }
-    return { newHoldId };
   }
 
-  async issueRefund(orderId: string): Promise<{ refundId: string }> {
+  async issueRefund(
+    orderId: string,
+    idempotencyKey: string,
+    inputJson: string,
+    reason: string
+  ): Promise<{ success: true; refund_id: string; new_order_status: string; reason: string }> {
     const payment = await this.getPaymentByOrder(orderId);
     if (!payment) throw new Error(`No payment record found for ${orderId}`);
     const refundId = `R${Date.now()}`;
@@ -162,13 +185,27 @@ export class OpsRepository {
       await client.query("BEGIN");
       await client.query("UPDATE payments SET status = 'refunded' WHERE order_id = $1", [orderId]);
       await client.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
+      const result = {
+        success: true,
+        refund_id: refundId,
+        new_order_status: "refunded",
+        reason,
+      } as const;
+      await client.query(
+        "INSERT INTO action_log (order_id, tool_name, input_json, result_json, success) VALUES ($1, $2, $3, $4, $5)",
+        [orderId, "issue_refund", inputJson, JSON.stringify(result), true]
+      );
+      await client.query(
+        "INSERT INTO idempotency_keys (tool_name, key, result) VALUES ($1, $2, $3)",
+        ["issue_refund", idempotencyKey, JSON.stringify(result)]
+      );
       await client.query("COMMIT");
+      return result;
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
     } finally {
       client.release();
     }
-    return { refundId };
   }
 }

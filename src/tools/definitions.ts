@@ -134,29 +134,30 @@ export function buildToolDefinitions(repo: OpsRepository) {
                 error: `Order ${input.order_id} has status '${order.status}', not 'failed'. Re-investigate before acting.`,
               };
             } else {
-              const r = await repo.reconfirmOrder(input.order_id);
-              result = {
-                success: true,
-                new_order_status: "confirmed",
-                new_hold_id: r.newHoldId,
-                note: "Call get_shipment_status next to verify fulfillment picked this up.",
-              };
+              result = await repo.reconfirmOrder(input.order_id, input.idempotency_key, JSON.stringify(input));
             }
           } catch (err) {
             result = { error: err instanceof Error ? err.message : String(err) };
           }
         }
 
-        await repo.logAction({
-          order_id: input.order_id,
-          tool_name: "reconfirm_order",
-          input_json: JSON.stringify(input),
-          result_json: JSON.stringify(result),
-          success: !("error" in result),
-        });
-
-        if (!isReplay) {
+        if (isReplay) {
+          await repo.logAction({
+            order_id: input.order_id,
+            tool_name: "reconfirm_order",
+            input_json: JSON.stringify(input),
+            result_json: JSON.stringify(result),
+            success: !("error" in result),
+          });
+        } else if ("error" in result) {
           await repo.storeIdempotencyResult("reconfirm_order", input.idempotency_key, result);
+          await repo.logAction({
+            order_id: input.order_id,
+            tool_name: "reconfirm_order",
+            input_json: JSON.stringify(input),
+            result_json: JSON.stringify(result),
+            success: false,
+          });
         }
 
         return result;
@@ -216,13 +217,7 @@ export function buildToolDefinitions(repo: OpsRepository) {
                   error: `Order ${input.order_id} has no captured payment to refund (payment status: ${payment?.status ?? "none"}).`,
                 };
               } else {
-                const r = await repo.issueRefund(input.order_id);
-                result = {
-                  success: true,
-                  refund_id: r.refundId,
-                  new_order_status: "refunded",
-                  reason: input.reason,
-                };
+                result = await repo.issueRefund(input.order_id, input.idempotency_key, JSON.stringify(input), input.reason);
               }
             }
           } catch (err) {
@@ -230,16 +225,23 @@ export function buildToolDefinitions(repo: OpsRepository) {
           }
         }
 
-        await repo.logAction({
-          order_id: input.order_id,
-          tool_name: "issue_refund",
-          input_json: JSON.stringify(input),
-          result_json: JSON.stringify(result),
-          success: !("error" in result),
-        });
-
-        if (!isReplay) {
+        if (isReplay) {
+          await repo.logAction({
+            order_id: input.order_id,
+            tool_name: "issue_refund",
+            input_json: JSON.stringify(input),
+            result_json: JSON.stringify(result),
+            success: !("error" in result),
+          });
+        } else if ("error" in result) {
           await repo.storeIdempotencyResult("issue_refund", input.idempotency_key, result);
+          await repo.logAction({
+            order_id: input.order_id,
+            tool_name: "issue_refund",
+            input_json: JSON.stringify(input),
+            result_json: JSON.stringify(result),
+            success: false,
+          });
         }
 
         return result;

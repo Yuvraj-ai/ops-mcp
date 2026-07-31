@@ -185,6 +185,46 @@ async function run() {
   );
   check("idempotency key stored once", idemCount.rows[0].count === 1);
 
+  // === Transactional audit + idempotency ===
+  console.log("\n== Transactional audit + idempotency ==");
+
+  // A1001 starts as 'delivered' with captured payment — refund it, then verify
+  // both action_log and idempotency_keys were written INSIDE the same DB transaction
+  const txnRefund = await byName.issue_refund.handler({
+    order_id: "A1001",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440088",
+    amount: 1499,
+    reason: "transactional test",
+    confirmed_by_operator: true,
+  }) as any;
+  check("transactional refund succeeds", txnRefund.success === true);
+
+  const txnIdem = await pool.query(
+    "SELECT result FROM idempotency_keys WHERE key = $1",
+    ["550e8400-e29b-41d4-a716-446655440088"]
+  );
+  check("idempotency key committed in same txn as mutation", txnIdem.rows.length === 1);
+  const txnIdemResult = JSON.parse(txnIdem.rows[0].result);
+  check("idempotency result matches successful refund", txnIdemResult.success === true);
+
+  const txnAudit = await pool.query(
+    "SELECT success, result_json FROM action_log WHERE order_id = $1 AND tool_name = $2",
+    ["A1001", "issue_refund"]
+  );
+  check("audit log committed in same txn as mutation", txnAudit.rows.length >= 1);
+  const txnAuditResult = JSON.parse(txnAudit.rows[0].result_json);
+  check("audit log result matches successful refund", txnAuditResult.success === true);
+
+  // Replay should return same result — proves idempotency key was committed
+  const txnReplay = await byName.issue_refund.handler({
+    order_id: "A1001",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440088",
+    amount: 1499,
+    reason: "transactional test replay (should be ignored)",
+    confirmed_by_operator: true,
+  }) as any;
+  check("replay returns stored result, not re-execution error", txnReplay.success === true);
+
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();
   if (failed > 0) process.exit(1);
