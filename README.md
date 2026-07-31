@@ -118,4 +118,120 @@ Remember to set `DATABASE_URL` in your deployment environment.
 
 Point any MCP-over-HTTP client (Streamable HTTP transport, stateless mode)
 at `POST /mcp` on the deployed URL.
-# ops-mcp
+
+### OpenCode
+
+OpenCode discovers MCP servers from the `mcpServers` field in your
+`~/.opencode.json` or a `.opencode.json` in your project root.
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "url": "http://<host>:<port>/mcp"
+    }
+  }
+}
+```
+
+In a conversation, invoke the agent directly on an order:
+
+```
+/opencode ops-mcp help me with order A1023 — customer says they were charged but the order failed
+```
+
+OpenCode will start a session with the MCP tools registered. No extra
+configuration needed beyond the JSON snippet above.
+
+### Claude Code
+
+Claude Code reads MCP server config from the Claude Desktop config file
+(`claude_desktop_config.json` on macOS/Windows, `~/.config/Claude/claude_desktop_config.json`
+on Linux) or from a local `.mcp.json` in the project root (Claude Code 1.95+).
+
+**Local `.mcp.json`** (recommended for per-project scoping):
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "command": "node",
+      "args": ["dist/server.js"],
+      "env": {
+        "DATABASE_URL": "postgresql://..."
+      },
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+If the server is running remotely (Streamable HTTP), use the URL form:
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "url": "http://<host>:<port>/mcp",
+      "transport": "httpStream"
+    }
+  }
+}
+```
+
+Then in Claude Code, run:
+
+```
+/opencode ops-mcp investigate order A1023
+```
+
+or simply mention the tools in a normal prompt — Claude Code will
+discover and call them automatically.
+
+### Codex
+
+Codex reads MCP config from `~/.codex/mcp.json` or `.codex/mcp.json` in
+the project root.
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "command": "node",
+      "args": ["/abs/path/to/ops-mcp/dist/server.js"],
+      "env": {
+        "DATABASE_URL": "postgresql://..."
+      },
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+If the server is already running over HTTP:
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "url": "http://<host>:<port>/mcp"
+    }
+  }
+}
+```
+
+Then in a Codex task prompt:
+
+```
+Use the ops-mcp server to investigate order A1023: a customer says they were
+charged but the order shows as failed. Check order details, payment status,
+inventory hold, and stock. Recommend a resolution and wait for approval.
+```
+
+Codex will auto-discover the registered MCP tools and use them.
+
+---
+
+## License
+
+MIT License with a commercial attribution clause — see [LICENSE](./LICENSE).
