@@ -30,13 +30,15 @@ execute pattern.
 
 ## Data
 
-In-memory SQLite, fully reseeded on every process boot (see
-`src/db/schema.ts`). No external database to host or connect to — the
-seeded dataset is deterministic so every test run starts from the same
-known state. 10 orders are seeded, covering: normal happy-path orders, the
-two core scenario orders (A1023 = reconfirm path, A1024 = refund path), and
-three deliberate edge cases (an already-refunded order, a cancelled order,
-and a "decoy" order that looks similar but isn't actually broken).
+Hosted PostgreSQL, seeded once via `npm run seed`. Set the `DATABASE_URL`
+environment variable (see `.env.example`) to point at your Postgres instance
+(e.g. Supabase, Neon, or a local Docker container). The schema is defined in
+`src/db/schema.sql`; seed data lives in `src/db/seed.ts` and uses
+`INSERT ... ON CONFLICT DO NOTHING` for idempotent re-seeding. 10 orders
+are seeded, covering: normal happy-path orders, the two core scenario
+orders (A1023 = reconfirm path, A1024 = refund path), and three deliberate
+edge cases (an already-refunded order, a cancelled order, and a "decoy"
+order that looks similar but isn't actually broken).
 
 ## MCP tools
 
@@ -57,6 +59,17 @@ the calling model) are in `src/tools/definitions.ts`.
 
 ## Running locally
 
+Set up your environment first:
+
+```bash
+cp .env.example .env
+# Edit .env to add your DATABASE_URL pointing at a PostgreSQL instance
+# Load it: `export $(cat .env | xargs)` or use a .env loader
+npm run seed  # one-time: creates tables and inserts seed data
+```
+
+Then:
+
 ```
 npm install
 npm run dev       # starts the MCP server on :3000 with tsx (no build step)
@@ -67,20 +80,24 @@ MCP endpoint: `POST http://localhost:3000/mcp`
 
 ## Running the tests
 
+Tests use `pg-mem` (in-memory PostgreSQL), so no external database is needed:
+
 ```
 npm test
 ```
 
 This runs `src/tests/tools.test.ts`, which calls the tool handlers directly
-(bypassing HTTP/MCP transport) against a fresh in-memory DB and checks both
-resolution paths plus all safety-rejection cases.
+(bypassing HTTP/MCP transport) against an in-memory Postgres DB (via
+`pg-mem`) and checks both resolution paths plus all safety-rejection cases.
 
-## Building for deployment
+### Building for deployment
 
 ```
 npm run build
 npm start          # runs dist/server.js, respects $PORT
 ```
+
+Remember to set `DATABASE_URL` in your deployment environment.
 
 ## Connecting an MCP client
 

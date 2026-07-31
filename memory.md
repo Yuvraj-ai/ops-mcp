@@ -42,13 +42,13 @@ SQLite/PostgreSQL (src/db/schema.ts)
 
 ## Pending Changes (from handoff.md)
 
-1. [ ] Migrate from in-memory SQLite to hosted PostgreSQL (Neon/Supabase)
+1. [x] Migrate from in-memory SQLite to hosted PostgreSQL — DONE: `pg` driver, `pg-mem` for tests, schema.sql DDL, seed.ts standalone script, all async. Tests pass 14/14.
 2. [ ] Add audit log (`action_log` table: id, order_id, tool_name, input_json, result_json, success, performed_at)
 3. [ ] Add true idempotency via agent-generated key (Option A — locked)
 4. [ ] Fix oversell race condition in `reconfirm_order` (atomic conditional UPDATE)
 5. [ ] Audit hold/stock mutations are correctly scoped by order_id/hold id
-6. [ ] Re-run full verification suite against Postgres-backed version
-7. [ ] Update README for Postgres setup
+6. [x] Re-run full verification suite against Postgres-backed version — DONE: 14/14 tests pass with pg-mem
+7. [x] Update README for Postgres setup — DONE
 8. [ ] Deployment (Render/Railway/Fly)
 
 ## Seed Data Reference

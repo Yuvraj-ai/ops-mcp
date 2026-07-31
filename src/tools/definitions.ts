@@ -14,8 +14,8 @@ export function buildToolDefinitions(repo: OpsRepository) {
         "creation time. Always call this first when investigating any order-related issue " +
         "raised by an operations user. Read-only - safe to call any number of times.",
       inputSchema: orderIdShape,
-      handler: (input: { order_id: string }) => {
-        const order = repo.getOrder(input.order_id);
+      handler: async (input: { order_id: string }) => {
+        const order = await repo.getOrder(input.order_id);
         if (!order) return { error: `No order found with ID ${input.order_id}.` };
         return order;
       },
@@ -27,8 +27,8 @@ export function buildToolDefinitions(repo: OpsRepository) {
         "failed, or refunded, and when. Use this to check whether a customer was actually " +
         "charged. Read-only - safe to call repeatedly.",
       inputSchema: orderIdShape,
-      handler: (input: { order_id: string }) => {
-        const payment = repo.getPaymentByOrder(input.order_id);
+      handler: async (input: { order_id: string }) => {
+        const payment = await repo.getPaymentByOrder(input.order_id);
         if (!payment) return { error: `No payment record found for order ${input.order_id}.` };
         return payment;
       },
@@ -41,8 +41,8 @@ export function buildToolDefinitions(repo: OpsRepository) {
         "hold on an otherwise-paid order is a common root cause of 'charged but order failed' " +
         "tickets. Read-only.",
       inputSchema: orderIdShape,
-      handler: (input: { order_id: string }) => {
-        const hold = repo.getHoldByOrder(input.order_id);
+      handler: async (input: { order_id: string }) => {
+        const hold = await repo.getHoldByOrder(input.order_id);
         if (!hold) return { error: `No inventory hold record found for order ${input.order_id}.` };
         return hold;
       },
@@ -58,8 +58,8 @@ export function buildToolDefinitions(repo: OpsRepository) {
         sku: z.string().describe("The SKU to check, e.g. 'SKU-202'"),
         quantity: z.number().int().positive().describe("Quantity needed"),
       },
-      handler: (input: { sku: string; quantity: number }) => {
-        const stock = repo.getStock(input.sku);
+      handler: async (input: { sku: string; quantity: number }) => {
+        const stock = await repo.getStock(input.sku);
         if (!stock) return { error: `No stock record found for SKU ${input.sku}.` };
         return {
           sku: stock.sku,
@@ -76,8 +76,8 @@ export function buildToolDefinitions(repo: OpsRepository) {
         "fulfillment pipeline correctly before reporting success to the operations user. " +
         "Read-only.",
       inputSchema: orderIdShape,
-      handler: (input: { order_id: string }) => {
-        const shipment = repo.getShipmentByOrder(input.order_id);
+      handler: async (input: { order_id: string }) => {
+        const shipment = await repo.getShipmentByOrder(input.order_id);
         if (!shipment) {
           return {
             info: `No shipment record exists yet for order ${input.order_id}. This is expected if the order has not been confirmed.`,
@@ -105,8 +105,8 @@ export function buildToolDefinitions(repo: OpsRepository) {
             "Must be explicitly true. Only set this after the human operator has approved this exact action."
           ),
       },
-      handler: (input: { order_id: string; confirmed_by_operator: true }) => {
-        const order = repo.getOrder(input.order_id);
+      handler: async (input: { order_id: string; confirmed_by_operator: true }) => {
+        const order = await repo.getOrder(input.order_id);
         if (!order) return { error: `No order found with ID ${input.order_id}.` };
         if (order.status === "refunded" || order.status === "cancelled") {
           return { error: `Order ${input.order_id} is '${order.status}' and cannot be reconfirmed.` };
@@ -116,7 +116,7 @@ export function buildToolDefinitions(repo: OpsRepository) {
             error: `Order ${input.order_id} has status '${order.status}', not 'failed'. Reconfirm is only valid for failed orders. Re-investigate before acting.`,
           };
         }
-        const result = repo.reconfirmOrder(input.order_id);
+        const result = await repo.reconfirmOrder(input.order_id);
         return {
           success: true,
           new_order_status: "confirmed",
@@ -143,24 +143,24 @@ export function buildToolDefinitions(repo: OpsRepository) {
             "Must be explicitly true. Only set this after the human operator has approved this exact refund."
           ),
       },
-      handler: (input: {
+      handler: async (input: {
         order_id: string;
         amount: number;
         reason: string;
         confirmed_by_operator: true;
       }) => {
-        const order = repo.getOrder(input.order_id);
+        const order = await repo.getOrder(input.order_id);
         if (!order) return { error: `No order found with ID ${input.order_id}.` };
         if (order.status === "refunded") {
           return { error: `Order ${input.order_id} has already been refunded.` };
         }
-        const payment = repo.getPaymentByOrder(input.order_id);
+        const payment = await repo.getPaymentByOrder(input.order_id);
         if (!payment || payment.status !== "captured") {
           return {
             error: `Order ${input.order_id} has no captured payment to refund (payment status: ${payment?.status ?? "none"}).`,
           };
         }
-        const result = repo.issueRefund(input.order_id);
+        const result = await repo.issueRefund(input.order_id);
         return {
           success: true,
           refund_id: result.refundId,

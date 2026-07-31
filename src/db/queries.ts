@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import type { Pool } from "pg";
 
 export interface OrderRow {
   id: string;
@@ -37,80 +37,90 @@ export interface ShipmentRow {
 
 /** Data-access layer: every MCP tool goes through this, never raw SQL inline. */
 export class OpsRepository {
-  constructor(private db: Database.Database) {}
+  constructor(private pool: Pool) {}
 
-  getOrder(orderId: string): OrderRow | undefined {
-    return this.db.prepare(`SELECT * FROM orders WHERE id = ?`).get(orderId) as
-      | OrderRow
-      | undefined;
+  async getOrder(orderId: string): Promise<OrderRow | undefined> {
+    const result = await this.pool.query("SELECT * FROM orders WHERE id = $1", [orderId]);
+    return result.rows[0] as OrderRow | undefined;
   }
-  getPaymentByOrder(orderId: string): PaymentRow | undefined {
-    return this.db.prepare(`SELECT * FROM payments WHERE order_id = ?`).get(orderId) as
-      | PaymentRow
-      | undefined;
+  async getPaymentByOrder(orderId: string): Promise<PaymentRow | undefined> {
+    const result = await this.pool.query("SELECT * FROM payments WHERE order_id = $1", [orderId]);
+    return result.rows[0] as PaymentRow | undefined;
   }
-  getHoldByOrder(orderId: string): HoldRow | undefined {
-    return this.db.prepare(`SELECT * FROM inventory_holds WHERE order_id = ?`).get(orderId) as
-      | HoldRow
-      | undefined;
+  async getHoldByOrder(orderId: string): Promise<HoldRow | undefined> {
+    const result = await this.pool.query("SELECT * FROM inventory_holds WHERE order_id = $1", [orderId]);
+    return result.rows[0] as HoldRow | undefined;
   }
-  getStock(sku: string): StockRow | undefined {
-    return this.db.prepare(`SELECT * FROM inventory_stock WHERE sku = ?`).get(sku) as
-      | StockRow
-      | undefined;
+  async getStock(sku: string): Promise<StockRow | undefined> {
+    const result = await this.pool.query("SELECT * FROM inventory_stock WHERE sku = $1", [sku]);
+    return result.rows[0] as StockRow | undefined;
   }
-  getShipmentByOrder(orderId: string): ShipmentRow | undefined {
-    return this.db.prepare(`SELECT * FROM shipments WHERE order_id = ?`).get(orderId) as
-      | ShipmentRow
-      | undefined;
+  async getShipmentByOrder(orderId: string): Promise<ShipmentRow | undefined> {
+    const result = await this.pool.query("SELECT * FROM shipments WHERE order_id = $1", [orderId]);
+    return result.rows[0] as ShipmentRow | undefined;
   }
 
-  reconfirmOrder(orderId: string): { newHoldId: string } {
-    const order = this.getOrder(orderId);
+  async reconfirmOrder(orderId: string): Promise<{ newHoldId: string }> {
+    const order = await this.getOrder(orderId);
     if (!order) throw new Error(`Order ${orderId} not found`);
-    const hold = this.getHoldByOrder(orderId);
+    const hold = await this.getHoldByOrder(orderId);
     if (!hold) throw new Error(`No inventory hold record found for ${orderId}`);
 
     const newHoldId = `H${Date.now()}`;
     const expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
 
-    const tx = this.db.transaction(() => {
-      this.db
-        .prepare(`UPDATE inventory_stock SET available_qty = available_qty - ? WHERE sku = ?`)
-        .run(hold.quantity, hold.sku);
-      this.db
-        .prepare(
-          `INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES (?, ?, ?, ?, 'active', ?)`
-        )
-        .run(newHoldId, orderId, hold.sku, hold.quantity, expiresAt);
-      this.db.prepare(`UPDATE orders SET status = 'confirmed' WHERE id = ?`).run(orderId);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        "UPDATE inventory_stock SET available_qty = available_qty - $1 WHERE sku = $2",
+        [hold.quantity, hold.sku]
+      );
+      await client.query(
+        "INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES ($1, $2, $3, $4, 'active', $5)",
+        [newHoldId, orderId, hold.sku, hold.quantity, expiresAt]
+      );
+      await client.query("UPDATE orders SET status = 'confirmed' WHERE id = $1", [orderId]);
 
-      const existingShipment = this.getShipmentByOrder(orderId);
+      const existingShipment = await this.getShipmentByOrder(orderId);
       if (existingShipment) {
-        this.db
-          .prepare(`UPDATE shipments SET status = 'pending', updated_at = ? WHERE order_id = ?`)
-          .run(new Date().toISOString(), orderId);
+        await client.query(
+          "UPDATE shipments SET status = 'pending', updated_at = $1 WHERE order_id = $2",
+          [new Date().toISOString(), orderId]
+        );
       } else {
-        this.db
-          .prepare(
-            `INSERT INTO shipments (id, order_id, status, carrier, updated_at) VALUES (?, ?, 'pending', NULL, ?)`
-          )
-          .run(`S${Date.now()}`, orderId, new Date().toISOString());
+        await client.query(
+          "INSERT INTO shipments (id, order_id, status, carrier, updated_at) VALUES ($1, $2, 'pending', NULL, $3)",
+          [`S${Date.now()}`, orderId, new Date().toISOString()]
+        );
       }
-    });
-    tx();
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
     return { newHoldId };
   }
 
-  issueRefund(orderId: string): { refundId: string } {
-    const payment = this.getPaymentByOrder(orderId);
+  async issueRefund(orderId: string): Promise<{ refundId: string }> {
+    const payment = await this.getPaymentByOrder(orderId);
     if (!payment) throw new Error(`No payment record found for ${orderId}`);
     const refundId = `R${Date.now()}`;
-    const tx = this.db.transaction(() => {
-      this.db.prepare(`UPDATE payments SET status = 'refunded' WHERE order_id = ?`).run(orderId);
-      this.db.prepare(`UPDATE orders SET status = 'refunded' WHERE id = ?`).run(orderId);
-    });
-    tx();
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE payments SET status = 'refunded' WHERE order_id = $1", [orderId]);
+      await client.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
     return { refundId };
   }
 }

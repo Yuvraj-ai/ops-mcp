@@ -1,14 +1,18 @@
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createDatabase } from "./db/schema.js";
+import { createPool, initDatabase } from "./db/schema.js";
 import { OpsRepository } from "./db/queries.js";
 import { buildToolDefinitions } from "./tools/definitions.js";
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 
-const db = createDatabase();
-const repo = new OpsRepository(db);
+const pool = createPool();
+initDatabase(pool).catch((err) => {
+  console.error("Failed to initialize database:", err);
+  process.exit(1);
+});
+const repo = new OpsRepository(pool);
 const toolDefs = buildToolDefinitions(repo);
 
 function buildMcpServer(): McpServer {
@@ -19,7 +23,7 @@ function buildMcpServer(): McpServer {
       tool.name,
       { description: tool.description, inputSchema: tool.inputSchema as any },
       async (args: any) => {
-        const result = tool.handler(args);
+        const result = await tool.handler(args);
         return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
       }
     );
