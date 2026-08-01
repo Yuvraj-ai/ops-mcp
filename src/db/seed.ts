@@ -207,7 +207,7 @@ if (__filename === process.argv[1]) {
       if (shouldReset) {
         console.log("Resetting database (TRUNCATE)...");
         return pool.query(
-          "TRUNCATE idempotency_keys, action_log, shipments, inventory_holds, inventory_stock, payments, orders RESTART IDENTITY CASCADE"
+          "TRUNCATE idempotency_keys, shipments, inventory_holds, inventory_stock, payments, orders RESTART IDENTITY CASCADE"
         );
       }
     })

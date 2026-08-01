@@ -31,7 +31,6 @@ function check(label: string, condition: boolean) {
 async function resetDatabase(pool: Pool): Promise<void> {
   await pool.query(`
     DROP TABLE IF EXISTS idempotency_keys;
-    DROP TABLE IF EXISTS action_log;
     DROP TABLE IF EXISTS shipments;
     DROP TABLE IF EXISTS inventory_holds;
     DROP TABLE IF EXISTS inventory_stock;

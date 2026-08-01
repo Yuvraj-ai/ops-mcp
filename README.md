@@ -80,11 +80,18 @@ safe to re-run on a live database; it will **not** overwrite or undo mutations
 an agent may have made (e.g. an order reconfirmed from `failed` to `confirmed`
 stays confirmed).
 
-**To reset demo state** (truncate all tables and re-seed from scratch):
+**To reset demo/business state** (truncate business tables and re-seed from
+scratch, **preserving the audit log**):
 
 ```bash
 npm run seed -- --reset
 ```
+
+The `--reset` flag truncates `inventory_stock`, `inventory_holds`, `shipments`,
+`payments`, and `orders` (resetting all business state to clean demo data) plus
+`idempotency_keys` (meaningless without their associated mutations). The
+`action_log` audit trail is **intentionally preserved** — it is a durable
+historical record by design, and should survive a business-state reset.
 
 Then:
 
