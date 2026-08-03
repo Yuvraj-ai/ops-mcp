@@ -28,6 +28,28 @@ reconciliation across warehouses. These are structurally similar problems
 we'd extend to next using the same investigate -> recommend -> approve ->
 execute pattern.
 
+## Architecture
+
+```
+AI agent (MCP client)
+        │  MCP over Streamable HTTP (stateless)
+        ▼
+Express server (src/server.ts)
+        │  registers 7 tools via @modelcontextprotocol/sdk McpServer
+        ▼
+Tool definitions (src/tools/definitions.ts)
+        │  each tool: name, AI-facing description, zod input shape, handler
+        ▼
+Data access layer (src/db/queries.ts) — OpsRepository class (all SQL lives here)
+        ▼
+Hosted PostgreSQL (Supabase)
+```
+
+All state lives in the Postgres database, and the MCP transport is stateless —
+a fresh `McpServer` + transport per request. This keeps hosting simple (no
+sticky sessions needed) with no downside, since there is no server-side
+session state to preserve.
+
 ## Data
 
 Hosted PostgreSQL, seeded once via `npm run seed`. Set the `DATABASE_URL`
@@ -60,6 +82,20 @@ Write (require an explicit `confirmed_by_operator: true` flag, only to be
 set once a human has approved the specific action):
 - `reconfirm_order`
 - `issue_refund`
+
+### Write-tool safety guarantees
+
+- **Explicit operator approval** — both write tools require `confirmed_by_operator: true`,
+  set only after a human approves the specific action.
+- **Idempotent replay** — both write tools require an agent-generated UUID `idempotency_key`.
+  Retrying with the same key replays the stored result instead of re-executing.
+- **Transactional audit + idempotency** — the `action_log` row and `idempotency_keys` row are
+  committed in the same transaction as the mutation; they commit or roll back together.
+- **Oversell protection** — stock decrement is a single atomic conditional
+  `UPDATE ... WHERE available_qty >= $N`; insufficient stock aborts and rolls back.
+
+Write-tool rejection paths (refunded order, no captured payment, order not `failed`)
+are logged but intentionally stand alone, since there's no mutation to share a transaction with.
 
 Full tool descriptions (including preconditions and safety notes fed to
 the calling model) are in `src/tools/definitions.ts`.
@@ -132,21 +168,27 @@ Remember to set `DATABASE_URL` in your deployment environment.
   starts and timeouts (10–15s). MCP over Streamable HTTP works but will be
   unreliable for longer-running operations. Use Render or Railway instead.
 
+**Render free-tier cold start:** the deployed instance sleeps after ~15 min
+idle; the first request after a gap can take 30-50s. Mitigate with a periodic
+keep-warm ping (e.g. a cron job hitting `/health`).
+
 ## Connecting an MCP client
 
-Point any MCP-over-HTTP client (Streamable HTTP transport, stateless mode)
-at `POST /mcp` on the deployed URL.
+The server is publicly deployed at `https://ops-mcp.onrender.com/mcp`. Point any
+MCP-over-HTTP client (Streamable HTTP transport, stateless mode) at that URL —
+or at `POST /mcp` on your own deployed instance.
 
 ### OpenCode
 
 OpenCode discovers MCP servers from the `mcpServers` field in your
-`~/.opencode.json` or a `.opencode.json` in your project root.
+`.opencode/mcp.json` in the project root (already configured here), or a
+`~/.opencode.json`.
 
 ```json
 {
   "mcpServers": {
     "ops-mcp": {
-      "url": "http://<host>:<port>/mcp"
+      "url": "https://ops-mcp.onrender.com/mcp"
     }
   }
 }
@@ -167,7 +209,21 @@ Claude Code reads MCP server config from the Claude Desktop config file
 (`claude_desktop_config.json` on macOS/Windows, `~/.config/Claude/claude_desktop_config.json`
 on Linux) or from a local `.mcp.json` in the project root (Claude Code 1.95+).
 
-**Local `.mcp.json`** (recommended for per-project scoping):
+**Remote (Streamable HTTP)** — use the public deployed server:
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "url": "https://ops-mcp.onrender.com/mcp",
+      "transport": "httpStream"
+    }
+  }
+}
+```
+
+**Local `.mcp.json`** (if you want to run the server yourself for per-project
+scoping or development):
 
 ```json
 {
@@ -179,19 +235,6 @@ on Linux) or from a local `.mcp.json` in the project root (Claude Code 1.95+).
         "DATABASE_URL": "postgresql://..."
       },
       "transport": "stdio"
-    }
-  }
-}
-```
-
-If the server is running remotely (Streamable HTTP), use the URL form:
-
-```json
-{
-  "mcpServers": {
-    "ops-mcp": {
-      "url": "http://<host>:<port>/mcp",
-      "transport": "httpStream"
     }
   }
 }
@@ -211,6 +254,20 @@ discover and call them automatically.
 Codex reads MCP config from `~/.codex/mcp.json` or `.codex/mcp.json` in
 the project root.
 
+**Remote (Streamable HTTP)** — use the public deployed server:
+
+```json
+{
+  "mcpServers": {
+    "ops-mcp": {
+      "url": "https://ops-mcp.onrender.com/mcp"
+    }
+  }
+}
+```
+
+**Local stdio** (if you want to run the server yourself):
+
 ```json
 {
   "mcpServers": {
@@ -221,18 +278,6 @@ the project root.
         "DATABASE_URL": "postgresql://..."
       },
       "transport": "stdio"
-    }
-  }
-}
-```
-
-If the server is already running over HTTP:
-
-```json
-{
-  "mcpServers": {
-    "ops-mcp": {
-      "url": "http://<host>:<port>/mcp"
     }
   }
 }

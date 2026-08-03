@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "ops-mcp": {
-      "url": "http://localhost:3000/mcp"
+      "url": "https://ops-mcp.onrender.com/mcp"
     }
   }
 }
