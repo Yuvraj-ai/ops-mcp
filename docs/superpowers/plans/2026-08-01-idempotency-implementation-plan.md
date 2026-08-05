@@ -346,7 +346,7 @@ Expected: `20 passed, 0 failed` (17 existing + 3 new idempotency checks)
 
 ```bash
 npm run build
-DATABASE_URL="postgresql://postgres.eovrhybvjtkkevxmuifb:Balleballeyuvraj.2003@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres" npm run seed
+DATABASE_URL="postgresql://postgres.eovrhybvjtkkevxmuifb:mtkrbhaiitsredacted.2003@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres" npm run seed
 ```
 
 - [ ] **Step 4: Live verification** — run idempotency flow against Supabase, verify both audit log and idempotency_keys tables populate

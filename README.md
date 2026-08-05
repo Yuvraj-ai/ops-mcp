@@ -93,6 +93,12 @@ set once a human has approved the specific action):
   committed in the same transaction as the mutation; they commit or roll back together.
 - **Oversell protection** — stock decrement is a single atomic conditional
   `UPDATE ... WHERE available_qty >= $N`; insufficient stock aborts and rolls back.
+- **Concurrent-write guards** — every consequential `UPDATE` re-checks its precondition in the
+  `WHERE` clause at write time; 0 affected rows aborts the transaction with an actionable error
+  telling the operator to re-investigate before acting.
+- **Refund releases inventory** — `issue_refund` releases any `status = 'active'` hold on the
+  order and credits the units back to `available_qty`, in the same transaction as the refund.
+  No phantom reservations standing after a refund.
 
 Write-tool rejection paths (refunded order, no captured payment, order not `failed`)
 are logged but intentionally stand alone, since there's no mutation to share a transaction with.
@@ -141,15 +147,33 @@ MCP endpoint: `POST http://localhost:3000/mcp`
 
 ## Running the tests
 
-Tests use `pg-mem` (in-memory PostgreSQL), so no external database is needed:
+Tests run against a **real PostgreSQL instance**, in a dedicated schema that the
+harness drops and recreates on every run:
 
 ```
-npm test
+npm test                  # 54 checks: tools, safety rejections, audit,
+                          # idempotency, concurrency guards, inventory release
+npm run test:concurrency  # 18 checks: genuinely simultaneous write attempts
+npm run test:all          # both suites
 ```
 
-This runs `src/tests/tools.test.ts`, which calls the tool handlers directly
-(bypassing HTTP/MCP transport) against an in-memory Postgres DB (via
-`pg-mem`) and checks both resolution paths plus all safety-rejection cases.
+Set `TEST_DATABASE_URL` to point at a Postgres instance; if unset, tests fall
+back to `DATABASE_URL`. Either way the harness pins its connections to a
+dedicated schema (`TEST_SCHEMA`, default `ops_mcp_test`), so business data in
+`public` is never touched by a test run — including a run that fails partway
+and leaves rows half-mutated.
+
+`src/tests/tools.test.ts` calls the tool handlers directly (bypassing the
+HTTP/MCP transport) and covers both resolution paths, every safety rejection,
+transactional rollback, and the conditional-write guards.
+`src/tests/concurrency.test.ts` fires simultaneous calls at the same order and
+asserts exactly one succeeds.
+
+> **Why not an in-memory mock?** The suite previously ran against `pg-mem`,
+> which was found to accept `BEGIN`/`ROLLBACK` without actually rolling back,
+> and has no row-level locking. Both properties are exactly what the write-path
+> guards depend on, so every abort-path assertion was passing without verifying
+> anything. See `docs/handoff.md` Appendix A.3.
 
 ### Building for deployment
 
