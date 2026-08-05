@@ -66,7 +66,15 @@ export class OpsRepository {
         [params.order_id, params.tool_name, params.input_json, params.result_json, params.success]
       );
     } catch (err) {
-      console.error("Failed to write audit log:", err);
+      // Non-blocking by design: this runs on the rejection path, where the
+      // transaction has already rolled back, so a failure here must not change
+      // the user-facing response. It must still be diagnosable from the log
+      // alone — hence tool, order, and outcome are named explicitly.
+      console.error(
+        `[audit-write-failed] tool=${params.tool_name} order=${params.order_id ?? "none"} ` +
+          `success=${params.success} — audit row was NOT written:`,
+        err
+      );
     }
   }
 
@@ -79,7 +87,11 @@ export class OpsRepository {
       if (result.rows.length === 0) return undefined;
       return JSON.parse(result.rows[0].result);
     } catch (err) {
-      console.error("Idempotency check failed, proceeding as fresh execution:", err);
+      console.error(
+        `[idempotency-check-failed] tool=${toolName} key=${key} — ` +
+          `proceeding as a fresh execution, so a retry may re-execute:`,
+        err
+      );
       return undefined;
     }
   }
@@ -91,7 +103,11 @@ export class OpsRepository {
         [toolName, key, JSON.stringify(result)]
       );
     } catch (err) {
-      console.error("Failed to store idempotency result:", err);
+      console.error(
+        `[idempotency-store-failed] tool=${toolName} key=${key} — ` +
+          `key was NOT stored, so a retry with this key will re-execute:`,
+        err
+      );
     }
   }
 

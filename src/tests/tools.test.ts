@@ -280,6 +280,77 @@ async function run() {
   check("1000 rapidly-generated IDs are all distinct", new Set(rapidIds).size === 1000);
   check("generated IDs keep their prefix", rapidIds.every((id) => id.startsWith("H")));
 
+  // === Rejection-path audit observability (Fix 2) ===
+  //
+  // Audit/idempotency writes on the rejection path are best-effort by design:
+  // the transaction they would belong to has already rolled back, so a failure
+  // here must not crash or alter the user-facing response. But "best-effort"
+  // must not mean "invisible" — a failure has to be diagnosable from the server
+  // log alone, which means naming the tool and order involved.
+  console.log("\n== Rejection-path audit observability ==");
+
+  const originalError = console.error;
+  const captured: string[] = [];
+  console.error = (...args: unknown[]) => {
+    captured.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+  };
+
+  let threw = false;
+  try {
+    // Simulate a transient DB fault the way it would actually present: the
+    // INSERT itself fails. (A bogus order_id would not — action_log has no FK on
+    // order_id by design, since rejections against unknown orders must still be
+    // logged.) Renaming the table out from under the write is the cheapest
+    // faithful stand-in for "the audit INSERT failed".
+    await pool.query("ALTER TABLE action_log RENAME TO action_log_stashed");
+    await repo.logAction({
+      order_id: "A1023",
+      tool_name: "reconfirm_order",
+      input_json: "{}",
+      result_json: "{}",
+      success: false,
+    });
+  } catch {
+    threw = true;
+  } finally {
+    await pool.query("ALTER TABLE action_log_stashed RENAME TO action_log");
+    console.error = originalError;
+  }
+
+  check("a failed audit write does not throw (stays non-blocking)", threw === false);
+  check("the failure is logged, not swallowed", captured.length > 0);
+
+  const auditLogLine = captured.join(" | ");
+  check("audit failure log names the tool", /reconfirm_order/.test(auditLogLine));
+  check("audit failure log names the order", /A1023/.test(auditLogLine));
+  check(
+    "audit failure log includes the underlying error",
+    /does not exist|relation|error/i.test(auditLogLine)
+  );
+
+  const capturedIdem: string[] = [];
+  console.error = (...args: unknown[]) => {
+    capturedIdem.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+  };
+  let idemThrew = false;
+  try {
+    // Duplicate key -> unique violation on the composite PK.
+    await repo.storeIdempotencyResult("issue_refund", "550e8400-e29b-41d4-a716-446655440099", { ok: true });
+    await repo.storeIdempotencyResult("issue_refund", "550e8400-e29b-41d4-a716-446655440099", { ok: true });
+  } catch {
+    idemThrew = true;
+  } finally {
+    console.error = originalError;
+  }
+
+  check("a failed idempotency store does not throw", idemThrew === false);
+  const idemLogLine = capturedIdem.join(" | ");
+  check("idempotency failure log names the tool", /issue_refund/.test(idemLogLine));
+  check(
+    "idempotency failure log names the key",
+    /550e8400-e29b-41d4-a716-446655440099/.test(idemLogLine)
+  );
+
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();
   if (failed > 0) process.exit(1);

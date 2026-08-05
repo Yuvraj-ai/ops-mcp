@@ -381,6 +381,49 @@ client to find — the same posture that had the shipment-read issue disclosed
 before the client independently confirmed it, which the developer noted was read
 favourably.
 
+### Fix 2: the reported defect was not the actual defect
+
+**Client's description:** rejection-path audit/idempotency write failures are
+"wrapped in a catch that discards errors silently — best-effort was implemented
+as failures are invisible."
+
+**What was actually there.** All three catch blocks in `src/db/queries.ts`
+already called `console.error` with the underlying error. Nothing was being
+discarded. Confirmed by writing the test before touching the code: the checks for
+"does not throw" and "the failure is logged" both passed against unmodified code,
+while the checks for naming the tool and order failed.
+
+**The real defect.** The log lines were unidentifiable:
+
+```
+Failed to store idempotency result: error: duplicate key value violates ...
+```
+
+No tool, no order, no key, no consequence. In Render's log stream — interleaved
+across concurrent requests — that cannot be traced back to the call that produced
+it, which makes it *effectively* invisible even though it was technically logged.
+So the client's conclusion was right; their stated mechanism was not.
+
+**Resolution.** Greppable tags plus identifying fields plus operational meaning:
+
+```
+[idempotency-store-failed] tool=reconfirm_order key=aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa
+  — key was NOT stored, so a retry with this key will re-execute:
+  error: duplicate key value violates unique constraint "idempotency_keys_pkey"
+```
+
+Non-blocking behavior was left exactly as-is and is now asserted rather than
+assumed — a failed audit write must not alter the user-facing rejection.
+
+**Process note.** A first attempt at the test tried to force the audit INSERT to
+fail using a bogus `order_id`, on the assumption that `action_log.order_id` had a
+foreign key. It does not — deliberately, since rejections against unknown order
+IDs must still be auditable. The insert succeeded and the test failed for the
+wrong reason. Switched to renaming the table mid-flight, which is a faithful
+stand-in for a transient DB fault. Worth recording because it is the third time
+in this project an assumption about the schema or the test substrate produced a
+misleading result.
+
 ---
 
 ## Files changed this session (all uncommitted)
