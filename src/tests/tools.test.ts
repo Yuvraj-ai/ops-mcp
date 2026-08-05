@@ -2,17 +2,16 @@
  * Focused runtime verification for the ops-mcp tool layer.
  *
  * This bypasses the HTTP/MCP transport and calls tool handlers directly
- * against a fresh Postgres DB, so it runs fast with no server needed.
+ * against a real Postgres database (dedicated test schema — see testdb.ts),
+ * so transactional behavior is genuinely exercised rather than emulated.
  * It covers the behavior that actually matters for the demo workflow:
  * the two resolution paths (reconfirm vs refund) and the safety rejections.
  *
  * Run with: npm test
  */
-import { newDb } from "pg-mem";
-import { initDatabase } from "../db/schema.js";
-import { OpsRepository } from "../db/queries.js";
+import { OpsRepository, newId } from "../db/queries.js";
 import { buildToolDefinitions } from "../tools/definitions.js";
-import { seedDatabase } from "../db/seed.js";
+import { createTestPool, resetTestSchema } from "./testdb.js";
 import type { Pool } from "pg";
 
 let passed = 0;
@@ -28,24 +27,9 @@ function check(label: string, condition: boolean) {
   }
 }
 
-async function resetDatabase(pool: Pool): Promise<void> {
-  await pool.query(`
-    DROP TABLE IF EXISTS idempotency_keys;
-    DROP TABLE IF EXISTS shipments;
-    DROP TABLE IF EXISTS inventory_holds;
-    DROP TABLE IF EXISTS inventory_stock;
-    DROP TABLE IF EXISTS payments;
-    DROP TABLE IF EXISTS orders;
-  `);
-  await initDatabase(pool);
-  await seedDatabase(pool);
-}
-
 async function run() {
-  const db = newDb();
-  const { Pool: MemPgPool } = db.adapters.createPg();
-  const pool = new MemPgPool() as unknown as Pool;
-  await resetDatabase(pool);
+  const pool = createTestPool();
+  await resetTestSchema(pool);
 
   const repo = new OpsRepository(pool);
   const tools = buildToolDefinitions(repo);
@@ -177,9 +161,11 @@ async function run() {
   check("second call with same key replays result (not re-execution)", secondRefund.success === true);
   check("replayed result matches first call", JSON.stringify(firstRefund) === JSON.stringify(secondRefund));
 
-  // Idempotency keys table should have exactly 1 entry for this key
+  // Idempotency keys table should have exactly 1 entry for this key.
+  // Cast to int in SQL: real Postgres returns COUNT(*) as a bigint, which the pg
+  // driver surfaces as a *string* (bigints can exceed JS's safe integer range).
   const idemCount = await pool.query(
-    "SELECT COUNT(*) as count FROM idempotency_keys WHERE key = $1",
+    "SELECT COUNT(*)::int as count FROM idempotency_keys WHERE key = $1",
     [idemKey]
   );
   check("idempotency key stored once", idemCount.rows[0].count === 1);
@@ -223,6 +209,76 @@ async function run() {
     confirmed_by_operator: true,
   }) as any;
   check("replay returns stored result, not re-execution error", txnReplay.success === true);
+
+  // === Concurrency guards (Fix 1b) ===
+  //
+  // These call the REPOSITORY methods directly, deliberately bypassing the
+  // handler's pre-check. That is exactly the state a losing concurrent request
+  // finds itself in: it passed the status check a moment ago, but by the time
+  // its UPDATE runs, a winning request has already committed a status change.
+  //
+  // NOTE: this proves the guard LOGIC in isolation (conditional UPDATE -> 0 rows
+  // -> abort -> rollback). The race itself, under genuinely simultaneous
+  // requests, is covered separately in concurrency.test.ts (`npm run
+  // test:concurrency`).
+  console.log("\n== Concurrency guards (state-changed aborts) ==");
+
+  // A1003 is 'processing', not 'failed', and its SKU-404 still has stock — so the
+  // stock decrement succeeds and execution actually reaches the status guard.
+  // (A stock-exhausted order would abort earlier, at the stock check, and never
+  // exercise the guard at all.)
+  const stockBeforeGuard = await byName.check_stock_availability.handler({ sku: "SKU-404", quantity: 1 }) as any;
+  check("guard-test order has stock available (so the guard, not the stock check, fires)", stockBeforeGuard.sufficient === true);
+  let reconfirmGuardError: string | null = null;
+  try {
+    await repo.reconfirmOrder("A1003", "550e8400-e29b-41d4-a716-446655440077", "{}");
+  } catch (err) {
+    reconfirmGuardError = err instanceof Error ? err.message : String(err);
+  }
+  check("reconfirmOrder aborts when order is no longer 'failed'", reconfirmGuardError !== null);
+  check(
+    "reconfirm abort message tells the operator to re-investigate",
+    /re-investigate/i.test(reconfirmGuardError ?? "")
+  );
+
+  const orderAfterGuard = await byName.get_order_details.handler({ order_id: "A1003" }) as any;
+  check("order untouched after guarded reconfirm abort", orderAfterGuard.status === "processing");
+
+  // Now runnable against real Postgres. Under pg-mem this assertion could not be
+  // made at all: pg-mem accepts ROLLBACK but does not honor it, so the decrement
+  // persisted and this check failed for reasons unrelated to our code.
+  const stockAfterGuard = await byName.check_stock_availability.handler({ sku: "SKU-404", quantity: 1 }) as any;
+  check(
+    "stock decrement ROLLED BACK after guarded reconfirm abort",
+    stockAfterGuard.available_qty === stockBeforeGuard.available_qty
+  );
+
+  const holdsAfterGuard = await pool.query("SELECT id FROM inventory_holds WHERE order_id = $1", ["A1003"]);
+  check("no duplicate hold created after guarded reconfirm abort", holdsAfterGuard.rows.length === 1);
+
+  // A1025 is already 'refunded'. A guarded UPDATE must match 0 rows.
+  let refundGuardError: string | null = null;
+  try {
+    await repo.issueRefund("A1025", "550e8400-e29b-41d4-a716-446655440078", "{}", "double refund attempt");
+  } catch (err) {
+    refundGuardError = err instanceof Error ? err.message : String(err);
+  }
+  check("issueRefund aborts when order is already refunded", refundGuardError !== null);
+
+  const refundAuditRows = await pool.query(
+    "SELECT id FROM action_log WHERE order_id = $1 AND tool_name = $2 AND success = true",
+    ["A1025", "issue_refund"]
+  );
+  check("no success audit row written for aborted double refund", refundAuditRows.rows.length === 0);
+
+  // === Unique ID generation (collision fix) ===
+  //
+  // Hold/shipment IDs were `H${Date.now()}` — two writes in the same
+  // millisecond collide on a TEXT PRIMARY KEY.
+  console.log("\n== Unique ID generation ==");
+  const rapidIds = Array.from({ length: 1000 }, () => newId("H"));
+  check("1000 rapidly-generated IDs are all distinct", new Set(rapidIds).size === 1000);
+  check("generated IDs keep their prefix", rapidIds.every((id) => id.startsWith("H")));
 
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();
