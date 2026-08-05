@@ -168,3 +168,249 @@ e167175 Transactional audit log + idempotency keys (main work of this session)
 0f6733d docs: add MCP client setup instructions for OpenCode, Claude Code, and Codex
 5bd74a7 feat: add --reset flag to seed CLI for clean demo state reset
 ```
+
+---
+
+# Session 2 — 2026-08-05 (Claude Opus, Claude Code CLI)
+
+**Model / configuration:** Claude Opus via Claude Code CLI 2.1.185, effort level `high`.
+Distinct from Session 1, which ran `poolside/laguna-s-2.1:free` via OpenRouter.
+
+**Task:** Client's second-round review items — Fix 1a (transaction-scoped reads),
+Fix 1b (guarded status UPDATEs), Fix 1c (real-Postgres concurrency test),
+Fix 2 (observable rejection-path logging), Fix 3 (handoff restructure).
+
+**Outcome:** 1a and 1b implemented and unit-tested (39/39, build clean, uncommitted).
+A third defect was found mid-work and folded in. 1c is blocked on a test-infrastructure
+decision. 2 appears largely pre-satisfied. 3 deliberately deferred to last.
+
+---
+
+## Process decision: skills invoked and skipped
+
+- **`using-superpowers`** — loaded at session start (system-injected).
+- **`test-driven-development`** — invoked before writing any production code. This
+  turned out to be the decisive call of the session; see Blocker 1 below.
+- **Skipped `brainstorming` / `writing-plans`** — deliberately. The client had
+  specified Fix 1b down to the exact SQL predicate, scope was ~30 lines in one
+  file, and there was no design space left to explore. A plan document would have
+  been longer than the diff. Judgment recorded here because "why no formal plan"
+  is a reasonable question to ask of this session.
+
+---
+
+## Blockers encountered and how they were resolved
+
+### Blocker 1 (resolved): a test passed against unfixed code — ID collisions masking the concurrency bug
+
+**What happened.** Following TDD, the guard tests were written and run *before*
+any fix. One reported PASS immediately — impossible if it tested what it claimed.
+
+**Investigation.** Probed the unfixed repository method directly against a fresh DB:
+
+```
+RECONFIRM: no error thrown
+A1027 holds: ["H1027","H1785934534503"]   <-- duplicate hold
+A1027 status: confirmed
+REFUND: no error thrown
+A1025 payment: refunded                    <-- already-refunded order refunded again
+```
+
+The concurrency bug was real and reproducible. The false PASS came from a
+*separate* defect: IDs were `${prefix}${Date.now()}`. Inside the full suite,
+A1023's reconfirm ran milliseconds earlier, so A1027's reconfirm generated a
+colliding `TEXT PRIMARY KEY` and threw a duplicate-key error. The test saw "an
+error was thrown" and scored it as the guard functioning.
+
+**Impact.** Four assertions were green for the wrong reason (order untouched,
+stock not decremented, no duplicate hold) — all passing because a PK collision
+rolled the transaction back, not because any guard fired.
+
+**Resolution.** Added `newId(prefix)` → `${prefix}${Date.now()}-${uuid8}`;
+replaced all three bare `Date.now()` ID templates. Folded into 1a/1b rather than
+filed separately, since it lives in the same functions.
+
+**Lesson worth carrying forward.** Implementation-first would have produced an
+all-green suite over a non-functional guard, with the collision permanently
+hiding the bug. This is the concrete argument for TDD on this codebase, not a
+theoretical one — and it is the single most defensible thing to show the client
+about verification rigor.
+
+### Blocker 2 (resolved): the guard test never reached the guard
+
+**What happened.** After the ID fix, the guard test failed with
+`Insufficient stock for SKU SKU-202: need 1, not available` — not the expected
+state-changed error.
+
+**Root cause.** In `reconfirmOrder()` the stock decrement precedes the status
+flip. The test used A1027, whose SKU-202 stock had already been consumed by
+A1023's reconfirm earlier in the same suite run, so execution aborted at the
+stock check and never reached the code under test.
+
+**Resolution.** Switched to A1003 (`processing`, SKU-404 with stock remaining)
+and added an explicit up-front assertion that stock is sufficient — so the test
+fails loudly if it ever again stops exercising the guard, rather than passing at
+the wrong checkpoint.
+
+**Note for future test authorship.** This suite shares one database across all
+checks in sequence, so any new test must account for state mutated by earlier
+tests. Order-dependence is a standing hazard here.
+
+### Blocker 3 (OPEN): pg-mem does not honor ROLLBACK
+
+**What happened.** An assertion that stock was rolled back after an aborted
+transaction failed. Probed `pg-mem` in isolation:
+
+```
+inside txn after decrement: 9
+rolled back: force abort
+AFTER ROLLBACK v = 9        <-- expected 10
+```
+
+**Finding.** `pg-mem` accepts `BEGIN`/`ROLLBACK` without error but does not
+actually roll back. This is materially broader than the "no MVCC" limitation
+already cited for Fix 1c: **every abort path in the existing 30-check suite has
+been green without verifying that cleanup occurred.**
+
+**Interim handling.** Removed the rollback assertion rather than let it fail for
+a reason unrelated to our code, with an explanatory comment at
+`src/tests/tools.test.ts:254`. The remaining 9 new checks prove the guard *logic*
+(conditional UPDATE → 0 rows → abort) but not rollback and not the race itself.
+
+**Escalation.** This widens Fix 1c: real Postgres is needed not only for the
+concurrency test but to re-verify existing rollback assertions.
+
+**Status: open, awaiting infrastructure decision.**
+
+### Blocker 4 (resolved by decision): choosing a real test database
+
+**Context.** With `pg-mem` disqualified, the developer proposed switching local
+tests to a file-backed SQLite database, reseeded before each suite run.
+
+**Recommendation given: decline the SQLite switch.** Reasoning:
+
+1. The property under test is *concurrency*. SQLite takes a database-level write
+   lock, not row-level, so the block-then-re-evaluate READ COMMITTED semantics
+   Fix 1b depends on don't exist there. A passing concurrency test would be as
+   uninformative as one in `pg-mem` — same failure mode, different engine.
+2. `BIGSERIAL`, `TIMESTAMPTZ`, `DEFAULT NOW()` (`src/db/schema.sql:44,50,59`)
+   have no SQLite equivalents → a second schema file → guaranteed drift from the
+   deployed one.
+3. ~75 `$N` placeholders across `queries.ts`/`seed.ts` are Postgres-style.
+4. Decisions Log #7 records that this project *deliberately migrated off* SQLite
+   at client request; reintroducing it in the test suite of a Postgres project is
+   a bad look in a submission the client is reading closely.
+
+**Kept from the proposal:** reseed-before-every-run is correct harness design and
+is already what `resetDatabase()` does — that pattern ports to real Postgres
+unchanged.
+
+**Environment findings.** No `docker` or `podman` on the machine. `postgresql
+18.4` is available via pacman. Recommended path: one `sudo pacman -S postgresql`,
+then an unprivileged `initdb` cluster on a nonstandard localhost port behind a
+`TEST_DATABASE_URL`. Fallback: a disposable schema on the existing Supabase
+project (never the production schema).
+
+**DECISION LOCKED (2026-08-05): disposable schema on the existing Supabase project.**
+Developer chose this over the local `initdb` cluster — real Postgres server rather
+than anything emulating one, with nothing to install or maintain locally. Accepted
+tradeoff: slower suite due to network latency per query.
+
+Follow-on requirements: a separate `TEST_DATABASE_URL` (never inherit
+`DATABASE_URL`, which points at production); a dedicated `ops_mcp_test`-style
+schema created/dropped by the harness; keep the existing reseed-per-run design;
+re-verify pre-existing rollback assertions once on real Postgres; drop the
+`pg-mem` dependency after the port is green.
+
+**IMPLEMENTED same session.** `src/tests/testdb.ts` pins `search_path` to
+`ops_mcp_test` on the existing Supabase project; schema dropped/recreated per run.
+`pg-mem` uninstalled. Main suite **40/40**, new concurrency suite **18/18**, build
+clean. Notably, the developer clarified mid-session that the `.env` database is
+demo/seed data rather than irreplaceable production data — the schema-isolation
+approach was kept regardless, since a failed concurrency test would otherwise
+leave the demo orders half-mutated right before a recording.
+
+### Blocker 5 (resolved): a second fake-passing assertion, exposed by the port
+
+**What happened.** First run against real Postgres: `idempotency key stored once`
+failed.
+
+**Root cause.** Postgres returns `COUNT(*)` as `bigint`; the `pg` driver surfaces
+that as a **string**, because bigints can exceed JS's safe integer range. `pg-mem`
+returned a plain number. The assertion used `=== 1`, so it had been passing purely
+because of `pg-mem`'s non-standard typing.
+
+**Resolution.** Cast in SQL — `COUNT(*)::int` — which is correct against real
+Postgres regardless of driver coercion.
+
+**Pattern worth noting.** This is the *second* assertion in this codebase found to
+be green for the wrong reason (the first being the ID-collision masking in
+Blocker 1). Both were only discoverable by changing the substrate underneath the
+tests. The count of passing checks was never the useful signal.
+
+### Finding: same-key idempotency does not replay under a true race
+
+**Discovered by** the new concurrency suite — not requested by the client.
+
+Two `reconfirm_order` calls with the *same* `idempotency_key`, fired
+simultaneously:
+
+```
+RESULT_1: {"success":true,"new_hold_id":"H1785938590195-16fa0599",...}
+RESULT_2: {"error":"Order A1023 state changed since it was read
+           (status is no longer 'failed'). ..."}
+```
+
+**Data integrity holds** — one hold, one decrement, one key row, one success audit
+row. But the *contract* doesn't: the stated behavior is "same key replays the
+stored result." Neither request sees the other's uncommitted idempotency row on
+its initial read, so the loser falls through to the Fix 1b guard and gets a
+state-changed error instead of a replay.
+
+Sequential retries — the realistic case, where an agent retries after a timeout —
+are unaffected, since the first call has committed by then.
+
+**Deliberately left unfixed.** The fix (catch the unique-violation on the
+idempotency INSERT, re-read, return the stored result) touches the write-path
+error handling that 1a/1b had just stabilised, and deserves its own review cycle.
+Asserted and commented in `concurrency.test.ts` so it cannot regress silently, and
+documented in handoff.md §5.5.5.
+
+**Judgment call:** disclosing this proactively rather than leaving it for the
+client to find — the same posture that had the shipment-read issue disclosed
+before the client independently confirmed it, which the developer noted was read
+favourably.
+
+---
+
+## Files changed this session (all uncommitted)
+
+```
+src/db/queries.ts        — newId() helper; transaction-scoped reads in both write
+                           methods; guarded status UPDATEs with rowCount aborts;
+                           getShipmentByOrderTx(); payment update scoped to 'captured'
+src/tests/tools.test.ts  — 9 new checks (concurrency guards + ID uniqueness);
+                           pg-mem ROLLBACK limitation documented inline
+docs/handoff.md          — new §5.5 Blockers section; 1a/1b marked done; 1c scope
+                           widened; Fix 2 re-assessed; changelog entry
+docs/claude-code-worklog-extract.md — this section
+```
+
+## Verification performed
+
+- `npm test` → **39/39 passing** (30 pre-existing + 9 new)
+- `npm run build` (tsc + schema copy) → clean, zero errors
+- Direct probes of unfixed code to confirm the bug was real before fixing it
+- Isolated probe of `pg-mem` ROLLBACK semantics to confirm Blocker 3
+
+**Not verified, explicitly:** rollback behavior and true concurrent access — both
+require Fix 1c. No live-Supabase re-verification was run this session, and nothing
+was committed or deployed.
+
+## Incidental observations (not acted on)
+
+- `orders.total_amount` and `payments.amount` are `REAL` in `schema.sql` — float
+  arithmetic on currency. Not raised by the client; flagged for consideration.
+- The local `.env` `DATABASE_URL` points at the **production** Supabase pooler.
+  Any test run or `--reset` that picks up that env var would hit the live demo
+  database. A separate `TEST_DATABASE_URL` is a prerequisite for Fix 1c.

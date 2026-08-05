@@ -65,7 +65,11 @@ Hosted PostgreSQL (Supabase, via Connection Pooler for IPv4 access)
 
 ## 3. Current State (as of last working session)
 
-**Status: fully deployed and verified. Live at `https://ops-mcp.onrender.com` (Render free tier), backed by a live Supabase Postgres instance. Only remaining step before final submission is a one-time production seed reset (see Pending Changes) — no open engineering work.**
+**Status: second-round client technical review, fixes in progress. Live at `https://ops-mcp.onrender.com` (Render free tier), backed by a live Supabase Postgres instance.**
+
+**As of 2026-08-05:** Fixes 1a and 1b are implemented and unit-tested (39/39 local checks pass, `npm run build` clean) but **not yet committed** — the diff is in the working tree pending review. Fix 1c is **blocked on a test-infrastructure decision** (see Blockers §6.1). Fix 2 appears to be already satisfied in the existing code and needs confirmation against what the client actually flagged. Fix 3 is deliberately last.
+
+**A discovery during this work widened the scope of Fix 1c** — `pg-mem` does not honor `ROLLBACK` at all, which means every abort/rollback path in the existing 30-check suite has been passing without actually verifying cleanup. Details in Blockers §6.1.
 
 Files (all under the project root, delivered as `ops-mcp.zip`):
 ```
@@ -112,11 +116,12 @@ package.json / tsconfig.json / README.md / .gitignore / .env.example
 | A1027 | Farhan Ali | confirmed | captured | active | pending | decoy: looks similar to core scenario but isn't broken |
 
 **Not yet done:**
-- One-time production seed reset (`npm run seed -- --reset`) immediately before final demo recording/submission — deliberately not done yet, see Pending Changes
-- Wiring an actual LLM client (e.g. Claude Desktop config) to call this MCP conversationally for the demo video
+- Wiring an actual LLM client (e.g. Claude Desktop config) to call this MCP conversationally, and recording the demo video with it
 - Loom video walkthrough
-- AI worklog document
-- Product-decisions write-up (separate from this handoff doc — that one is for assignment submission, written in plain prose, not this technical format)
+
+**Done, but produced in chat rather than the repo** (so not reflected in commit history — handed directly to the developer as standalone files):
+- AI worklog document (`ai-worklog.md`) — covers models used, planning/division of labor, a corrected AI suggestion (the non-transactional audit bug), and verification approach
+- Product decisions, assumptions, and exclusions write-up (`product-decisions.md`) — client-facing prose version of this handoff's Decisions Log, for submission
 
 ---
 
@@ -158,16 +163,203 @@ Full description strings (the actual text fed to the calling model) live in `src
 
 ---
 
+## 5.5 Blockers & Decisions Log (chronological, for claude.ai context)
+
+This section records problems hit during implementation and the reasoning behind
+each resolution — including approaches we considered and declined. Newest last.
+It exists so architectural decisions made on claude.ai have the full picture of
+what was actually encountered in the codebase, not just final outcomes.
+
+### 5.5.1 BLOCKER (open): local test database cannot verify transactional behavior
+
+**Symptom.** While writing tests for the Fix 1b guards, an assertion that stock
+was rolled back after an aborted transaction failed. Direct probe of `pg-mem`:
+
+```
+inside txn after decrement: 9
+rolled back: force abort
+AFTER ROLLBACK v = 9        <-- expected 10 if ROLLBACK were honored
+```
+
+**Finding.** `pg-mem` accepts `BEGIN`/`ROLLBACK` without error but does not
+actually roll back. This is broader than the known "no MVCC" limitation already
+cited for Fix 1c: it means **every abort path in the existing suite has been
+green without verifying that cleanup occurred.** Any test asserting "no partial
+write after failure" against `pg-mem` proves nothing.
+
+**Scope impact on Fix 1c.** 1c was originally scoped as "run the concurrency test
+against real Postgres." It must now also re-verify all existing rollback
+assertions, since their current passes are unreliable.
+
+**Options considered for the local test DB:**
+
+| Option | Verdict |
+|---|---|
+| Keep `pg-mem` | Rejected. Cannot verify rollback or row-level locking — the exact properties under review. |
+| Switch to file-backed SQLite | **Rejected** — reasoning below. |
+| Local Postgres via Docker | Unavailable — no `docker`/`podman` binary on the dev machine. |
+| Local Postgres via `initdb` (pacman `postgresql 18.4`) | **Recommended.** One `sudo pacman -S postgresql`; the cluster itself runs unprivileged on a nonstandard localhost port. |
+| Disposable schema on existing Supabase project | Viable fallback. Real Postgres, nothing to install; slower per query. Must never target the production/demo schema. |
+
+**Why not SQLite** (proposed 2026-08-05, declined with reasoning): the bug under
+test is a concurrency bug, and SQLite's concurrency model is not Postgres's — it
+takes a database-level write lock rather than row-level, so the
+block-then-re-evaluate READ COMMITTED semantics Fix 1b depends on do not exist
+there. A passing concurrency test in SQLite would be as uninformative as one in
+`pg-mem`. Additionally: `BIGSERIAL`, `TIMESTAMPTZ`, and `DEFAULT NOW()`
+(`src/db/schema.sql:44,50,59`) have no SQLite equivalents, so a second schema
+file would be needed and would drift from the deployed one; ~75 `$N`-style
+placeholders across `queries.ts`/`seed.ts` are Postgres-style; and Decisions Log
+#7 records that this project *deliberately migrated off* SQLite at client
+request. The lesson from the `pg-mem` failure is not "pick a closer imitation" —
+it is "test against the real engine."
+
+**Worth keeping from that proposal:** reseed-before-every-run is the right
+harness design and is already what `resetDatabase()` (`src/tests/tools.test.ts:31`)
+does. That pattern ports to real Postgres essentially unchanged.
+
+**DECISION LOCKED (2026-08-05): disposable schema on the existing Supabase project.**
+
+Chosen over the local `initdb` cluster. Developer's reasoning: testing against a
+real Postgres server is worth more than anything emulating one, and this option
+requires nothing installed or maintained locally. Accepted tradeoff: higher
+per-query latency over the network, so the suite will run slower than it did
+against `pg-mem`.
+
+Implementation requirements that follow from this decision:
+
+1. **A separate `TEST_DATABASE_URL` env var is a hard prerequisite.** The local
+   `.env` `DATABASE_URL` points at the production/demo pooler; tests must never
+   pick it up by default.
+2. **Tests target a dedicated schema** (e.g. `ops_mcp_test`), created and dropped
+   by the harness — never the `public`/production schema.
+3. **Keep the existing reseed-per-run design.** `resetDatabase()`
+   (`src/tests/tools.test.ts:31`) already drops, re-inits, and reseeds; it ports
+   to real Postgres essentially unchanged.
+4. **Re-verify the pre-existing rollback assertions**, not only the new
+   concurrency test — under `pg-mem` those were passing without actually
+   verifying cleanup.
+5. `pg-mem` dependency can be removed from `package.json` once the port is green.
+
+**Status: RESOLVED 2026-08-05.** Ported to real Postgres via `src/tests/testdb.ts`.
+`pg-mem` removed from `package.json`. Suite: **40/40** (`npm test`), plus a new
+**18/18** concurrency suite (`npm run test:concurrency`). The previously-impossible
+rollback assertion now runs and passes. Two real defects were exposed by the port
+itself — see §5.5.4 and §5.5.5.
+
+### 5.5.4 RESOLVED: `COUNT(*)` type difference exposed a fake-passing assertion
+
+On the first run against real Postgres, `idempotency key stored once` failed.
+Cause: Postgres returns `COUNT(*)` as `bigint`, which the `pg` driver surfaces as
+a **string** (bigints can exceed JS's safe integer range); `pg-mem` returned a
+number. The assertion used `=== 1`, so it had been passing *only* because of
+`pg-mem`'s non-standard typing — another check that was green for the wrong
+reason. Fixed by casting in SQL (`COUNT(*)::int`), which is correct against real
+Postgres regardless of driver behavior.
+
+### 5.5.5 KNOWN GAP (documented, unfixed): same-key idempotency under a true race
+
+**Found by** the new concurrency suite, not by the client.
+
+**Behavior.** Two `reconfirm_order` calls with the **same** `idempotency_key`,
+fired simultaneously:
+
+```
+RESULT_1: {"success":true,"new_hold_id":"H1785938590195-16fa0599",...}
+RESULT_2: {"error":"Order A1023 state changed since it was read
+           (status is no longer 'failed'). ..."}
+```
+
+**Data integrity is intact** — exactly one hold, one stock decrement, one
+`idempotency_keys` row, one success audit row. Nothing is double-executed.
+
+**The gap is contractual, not correctness.** The stated idempotency contract
+(Decisions Log #8, and the tool descriptions fed to the model) is "retry with the
+same key replays the stored result." That holds for *sequential* retries — the
+normal case, where a call times out and the agent retries — because the first
+call has committed its key by then. It does **not** hold for genuinely
+simultaneous same-key calls: neither request sees the other's uncommitted
+idempotency row on its initial read, so the loser falls through to the Fix 1b
+guard and gets a state-changed error instead of a replay. A server-side
+`console.error` for the duplicate-key violation is also emitted.
+
+**Proper fix (not implemented):** catch the unique-violation on the
+`idempotency_keys` INSERT, then re-read and return the stored result — turning
+the loser's error into the intended replay. Deliberately not done in this pass:
+it changes the write-path error handling that fixes 1a/1b just stabilised, and it
+warrants its own review cycle. Asserted and documented in
+`src/tests/concurrency.test.ts` so it cannot regress silently.
+
+**Assessment:** low practical impact (an LLM agent retries sequentially, not in
+parallel), but worth disclosing proactively — the same posture that had the
+shipment-read issue already disclosed before the client found it.
+
+### 5.5.2 RESOLVED: ID collisions were masking the concurrency bug
+
+**Symptom.** The first guard test for Fix 1b reported PASS *before any fix was
+written* — which should be impossible.
+
+**Root cause.** Probing the unfixed code on a fresh database showed the real
+behavior:
+
+```
+RECONFIRM: no error thrown
+A1027 holds: ["H1027","H1785934534503"]   <-- duplicate hold created
+A1027 status: confirmed
+```
+
+The concurrency bug was real and reproducible. The test's false PASS came from a
+*second* defect: hold/shipment IDs were `${prefix}${Date.now()}`. Within the full
+suite, A1023's reconfirm ran a few milliseconds earlier, so A1027's reconfirm
+generated the same millisecond-based ID, collided on the `TEXT PRIMARY KEY`, and
+threw a duplicate-key error. The test saw "an error was thrown" and scored it as
+the guard working.
+
+**Why this matters beyond the immediate fix.** Four assertions were green for the
+wrong reason. Had the implementation been written before the test — or had the
+test not been run against unfixed code first — a non-functional guard would have
+shipped with an all-green suite as its evidence.
+
+**Resolution.** Added `newId(prefix)` (`src/db/queries.ts`), returning
+`${prefix}${Date.now()}-${uuid8}`; replaced all three bare `Date.now()` ID
+templates (holds, shipments, refunds). Folded into 1a/1b rather than deferred,
+since it lives in the same functions and the same failure mode.
+
+### 5.5.3 RESOLVED: guard test was unreachable behind the stock check
+
+**Symptom.** After fixing the ID collision, the guard test failed with
+`Insufficient stock for SKU SKU-202: need 1, not available` rather than the
+expected state-changed error.
+
+**Root cause.** In `reconfirmOrder` the stock decrement runs *before* the status
+flip. The test used A1027, whose SKU-202 stock had already been consumed by
+A1023's reconfirm earlier in the suite, so execution aborted at the stock check
+and never reached the guard under test.
+
+**Resolution.** Switched the guard test to A1003 (`processing` status, SKU-404
+with stock remaining) and added an explicit assertion that stock is available
+first — so the test fails loudly if it ever stops exercising the guard again,
+rather than silently passing at the wrong checkpoint.
+
+---
+
 ## 6. Pending Changes
 
 *(This section should be edited by the developer/Claude before each Claude Code session — list concrete, specific tasks here.)*
 
-**Context:** All client-requested architecture changes (Postgres, audit history, idempotency, oversell protection — Decisions Log #7–9) and public deployment are complete and verified. One real fix identified below; the rest is submission-prep, not code.
+**Context:** Client reviewed the submitted artifacts (hosted MCP, repo, product-decisions PDF, AI worklog) and requested three fixes before final acceptance. This is a second, more technical review pass — not a rejection. Notably, item 1's shipment-read issue was already disclosed proactively in `ai-worklog.md`'s "Remaining risks" section; the client independently confirmed the same finding, which the developer takes as a good sign about how the submission is being read, even though it means more work before close-out.
 
-- [x] **Exclude `action_log` from the `--reset` TRUNCATE list.** Current `seed.ts` `--reset` flag ran `TRUNCATE idempotency_keys, action_log, shipments, inventory_holds, inventory_stock, payments, orders RESTART IDENTITY CASCADE` — this wiped the audit trail along with business state on every reset. The client's requirement was to "preserve workflow state **and** audit history" as two distinct things. Audit log's entire purpose is to be a durable historical record and should survive resets, or it can never function as an audit trail. Fix: removed `action_log` from the TRUNCATE statement, so `--reset` becomes "reset business state, preserve the permanent record." `idempotency_keys` remains in the reset list — those rows only have meaning tied to the specific business-state mutation they were generated against, so they become meaningless orphans once that state is reset, unlike audit history. README's `--reset` documentation updated to reflect this distinction explicitly.
-- [ ] **Reset production DB to clean seed state before final submission.** Run `npm run seed -- --reset` (locally, pointed at the production `DATABASE_URL`) once, right before recording the demo / submitting — not before, and only after the `action_log` exclusion fix above lands. Current production DB has real mutation history (A1023 already reconfirmed during testing) which is fine to leave in place until the very last step.
+- [x] **Fix 1a — move the in-transaction shipment-existence check onto the transaction's own client.** **DONE (uncommitted, 2026-08-05.)** Inside `reconfirmOrder()`, the shipment-existence read queried via the connection pool rather than the client the transaction's `BEGIN` was issued on, so it didn't participate in the transaction's isolation guarantee. Implemented: both `reconfirmOrder()` and `issueRefund()` now open the transaction *first* and perform every read on that transaction's `client` — the order, hold, and payment lookups moved inside `BEGIN`, and the shipment read became a new private `getShipmentByOrderTx(client, orderId)`. No read touches `this.pool` once `BEGIN` is issued. Secondary benefit: removes a potential self-deadlock where a transaction holding one connection requests a second from a saturated pool.
 
-Everything else — Postgres migration, live Supabase deployment, audit log, idempotency keys, oversell-race fix, transactional coupling, reservation scoping audit, README update, public hosting on Render, seed script safety — is DONE and verified. Full detail in the Changelog below.
+- [x] **Fix 1b — add a conditional guard on the order status UPDATE itself (not just the stock decrement).** **DONE (uncommitted, 2026-08-05.)** The gap was confirmed reproducible before fixing — see Blockers §5.5.2 for the probe output showing two holds on one order. Implemented: `UPDATE orders SET status = 'confirmed' WHERE id = $1 AND status = 'failed'` in `reconfirmOrder()`, and `UPDATE orders SET status = 'refunded' WHERE id = $1 AND status != 'refunded'` in `issueRefund()`; both check `rowCount === 0` and abort the transaction with an explicit "state changed since it was read … please re-investigate before acting" error. Also tightened the payment update to `AND status = 'captured'`. **Folded in (not originally scoped):** hold/shipment/refund IDs were `${prefix}${Date.now()}` and collide within a single millisecond on a `TEXT PRIMARY KEY` — replaced with `newId(prefix)` returning `${prefix}${Date.now()}-${uuid8}`. This collision was actively masking the concurrency bug (Blockers §5.5.2).
+
+- [x] **Fix 1c — a genuine concurrent-request test, run against real Postgres, not `pg-mem`.** **DONE (uncommitted, 2026-08-05.)** Test infrastructure ported off `pg-mem` entirely: new `src/tests/testdb.ts` creates a pool pinned to a dedicated schema (`ops_mcp_test`, via `search_path`) on the existing Supabase project, dropped and recreated per run so demo data in `public` is never touched. `pg-mem` removed from `package.json`. New `src/tests/concurrency.test.ts` (`npm run test:concurrency`) fires genuinely simultaneous calls and asserts: exactly one success and one rejection, one active hold, stock decremented exactly once, exactly one success row in `action_log`, and an actionable error for the loser — covering different-key reconfirm, same-key reconfirm, and different-key refund. **Results: 18/18 concurrency checks pass; main suite 40/40** (up from 39 — the restored rollback assertion). Fix 1b is now verified under real contention; the loser receives `"Order A1023 state changed since it was read (status is no longer 'failed'). No changes were made — please re-investigate before acting."` **Two defects were exposed by the port itself** — a fake-passing `COUNT(*)` assertion (§5.5.4) and a same-key idempotency gap (§5.5.5, documented, unfixed).
+
+- [ ] **Fix 2 — make rejection-path audit/idempotency write failures observable, not silently swallowed.** **LIKELY ALREADY SATISFIED — needs confirmation against the client's exact finding.** Inspection of `src/db/queries.ts` shows all three best-effort catch blocks (`logAction`, `getIdempotencyResult`, `storeIdempotencyResult`) already call `console.error` with the error rather than discarding it silently. What is *not* yet included is the tool name and order ID in those log lines, which the client's wording explicitly asks for ("at minimum `console.error` including tool name, order ID, and the error"). Remaining work is likely limited to enriching the log context. A metrics counter is a nice-to-have, not required.
+
+- [ ] **Fix 3 — restructure `handoff.md` into a clean closing document once fixes 1–2 land.** The client appears to have read `handoff.md` directly (referred to it by name as "the final handoff"), so it's effectively a submission artifact, not just an internal working doc. Once the above fixes are verified: strip the "Pending Changes" checklist framing entirely, remove any "not yet done" / in-progress language, and present the document as a finished project history (decisions + what was built + how it was verified), not a live task tracker. **Note:** §5.5 Blockers is written for working context; decide at that point whether to condense it into the Decisions Log or keep it as a "what we hit and how we handled it" appendix — it demonstrates verification rigor, which the client is evidently reading for. This should be the last edit made to this document before final resubmission.
+
+**After Fix 1–2 land:** re-run the full existing test suite (currently **39/39** locally, up from 30 — 9 new checks cover the guards and ID uniqueness) plus the new concurrency test, and re-verify the live deployment behaves correctly (existing 11-point live-check pattern, extended to include a concurrent-call check if feasible against a non-production instance).
 
 ---
 
@@ -182,3 +374,19 @@ Everything else — Postgres migration, live Supabase deployment, audit log, ide
 - **[2026-07-31] Public deployment on Render.** Deployed to Render free-tier Web Service at `https://ops-mcp.onrender.com`, build command `npm install && npm run build`, start command `npm start`, `DATABASE_URL` set to the Supabase pooler connection string. Postbuild step copies `src/db/schema.sql` into `dist/db/`. Verified live: `/health` returns all 7 tools, MCP `initialize` handshake succeeds over HTTPS, `tools/call` against `get_order_details` returns correct data for A1023 — confirming state genuinely persisted across the entire chain (local testing → Postgres migration → transactional fix → fresh Render deploy). Known tradeoff: free-tier instance sleeps after ~15 min idle, causing a cold-start delay (~30-50s) on the first request after a gap — to be mitigated with a keep-warm ping (e.g. cron-job.org hitting `/health` periodically) before evaluation/recording, or simply noted in the README.
 - **[2026-08-01] Seed script reset safety.** `seed.ts` previously used `ON CONFLICT DO NOTHING` — safe to re-run without crashing, but would not reset rows that had been mutated by real usage (e.g. a reconfirmed order stayed `confirmed` on re-seed, not reset to `failed`). Fixed: default behavior unchanged (still safe for accidental re-runs against a live DB); added an explicit `--reset` flag (`npm run seed -- --reset`) that runs `TRUNCATE ... RESTART IDENTITY CASCADE` across all app tables before re-seeding, for a genuine clean-slate reset. README updated to document both behaviors. Intended use: run `npm run seed -- --reset` against production `DATABASE_URL` once, immediately before final demo recording/submission — not before, since the current production DB's mutation history (e.g. A1023 already reconfirmed) is legitimate evidence the system has been exercised for real.
 - **[2026-08-01] Seed reset preserves audit history.** Fixed `--reset` flag in `seed.ts` to exclude `action_log` from the TRUNCATE list. The audit trail is a durable historical record by design (client requirement: "preserve workflow state and audit history as two distinct things"). `--reset` now truncates only business-state tables (`orders`, `payments`, `inventory_holds`, `inventory_stock`, `shipments`) plus `idempotency_keys` (orphaned once their mutations are gone), while `action_log` rows persist. Correspondingly removed `action_log` from the test teardown's `DROP TABLE` list — `initDatabase()` recreates it via `CREATE TABLE IF NOT EXISTS` in `schema.sql` regardless. README's `--reset` documentation updated to explain this distinction explicitly.
+- **[Production reset executed]** — `npm run seed -- --reset` run against production `DATABASE_URL`. Business-state tables reset to clean seed data (A1023/A1024 back to their intended `failed` demo states); `action_log` correctly preserved through the reset. This was the last open item — no engineering work remains. Ready for demo recording and final submission.
+- **[2026-08-05] Fix 1c + test infrastructure migration to real Postgres (UNCOMMITTED).**
+  - **Test DB migration:** removed `pg-mem` entirely. New `src/tests/testdb.ts` provides `createTestPool()` / `resetTestSchema()`, connecting to the existing Supabase project with `search_path` pinned to a dedicated `ops_mcp_test` schema that is dropped and recreated per run. Demo/business data in `public` is structurally out of reach of test runs. Honors `TEST_DATABASE_URL` if set, falling back to `DATABASE_URL`; `.env.example` documents both.
+  - **Restored assertion:** the stock-rollback check that `pg-mem` made impossible now runs and passes — real transactional rollback is verified for the first time.
+  - **New concurrency suite:** `src/tests/concurrency.test.ts` (`npm run test:concurrency`), 18 checks across three scenarios — concurrent reconfirm with different keys, with the same key, and concurrent refund with different keys. Asserts exactly-one-success, single hold, single stock decrement, single success audit row, and an actionable loser error.
+  - **Fix 1b verified under real contention.** The losing concurrent attempt receives: `"Order A1023 state changed since it was read (status is no longer 'failed'). No changes were made — please re-investigate before acting."`
+  - **Two defects exposed by the port:** (1) `idempotency key stored once` had been passing only because `pg-mem` returned `COUNT(*)` as a number where real Postgres returns a bigint string — fixed with `COUNT(*)::int` (§5.5.4); (2) same-key idempotency under a true race returns an error rather than a replay — data stays correct, contract does not hold; documented and asserted, deliberately unfixed (§5.5.5).
+  - **Results: 40/40 main suite, 18/18 concurrency suite, `npm run build` clean.**
+  - **Scripts:** `npm test` (main), `npm run test:concurrency`, `npm run test:all`.
+- **[2026-08-05] Fixes 1a + 1b + ID-collision fix (UNCOMMITTED — in working tree for review).** Client's second-round review items 1a and 1b implemented in `src/db/queries.ts`, with a third defect found and folded in during the work.
+  - **1a (transaction-scoped reads):** `reconfirmOrder()` and `issueRefund()` now issue `BEGIN` first and run every read on the transaction's own `client`. Order/hold/payment lookups moved inside the transaction; the pool-based shipment read became private `getShipmentByOrderTx(client, orderId)`. Nothing reads `this.pool` after `BEGIN`.
+  - **1b (guarded status flips):** `UPDATE orders SET status = 'confirmed' WHERE id = $1 AND status = 'failed'` and `UPDATE orders SET status = 'refunded' WHERE id = $1 AND status != 'refunded'`; `rowCount === 0` aborts the transaction with a "state changed since it was read … re-investigate" error. Payment update tightened to `AND status = 'captured'`.
+  - **ID collisions (not originally scoped):** `${prefix}${Date.now()}` IDs collide within a millisecond on `TEXT PRIMARY KEY`s. Added `newId(prefix)` → `${prefix}${Date.now()}-${uuid8}`, applied to holds, shipments, and refunds.
+  - **Verification:** **39/39 local checks pass** (30 pre-existing + 9 new), `npm run build` clean. The 9 new checks cover: guard aborts on a no-longer-`failed` order, abort message wording, order/hold left untouched, `issueRefund` abort on an already-refunded order, no success audit row for an aborted refund, and 1000 rapidly-generated IDs all distinct.
+  - **Honest limits on that verification (superseded by the 1c entry above):** at the time this work landed, the new checks proved the guard *logic* (conditional UPDATE → 0 rows → abort) but not rollback and not the race, because `pg-mem` honored neither. Both properties were subsequently verified once the suite moved to real Postgres.
+  - **Process note:** writing the tests first was what surfaced the ID-collision defect. The first guard test passed against *unfixed* code, because a PK collision was throwing an error that the test mistook for the guard working (Blockers §5.5.2). Implementation-first would have produced an all-green suite over a non-functional guard.
