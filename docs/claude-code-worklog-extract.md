@@ -180,7 +180,8 @@ Distinct from Session 1, which ran `poolside/laguna-s-2.1:free` via OpenRouter.
 Fix 1b (guarded status UPDATEs), Fix 1c (real-Postgres concurrency test),
 Fix 2 (observable rejection-path logging), Fix 3 (handoff restructure).
 
-**Outcome:** 1a and 1b implemented and unit-tested (39/39, build clean, uncommitted).
+**Outcome:** 1a and 1b implemented and unit-tested (39/39 at that point in the
+session; 54/54 by session end after later work, build clean).
 A third defect was found mid-work and folded in. 1c is blocked on a test-infrastructure
 decision. 2 appears largely pre-satisfied. 3 deliberately deferred to last.
 
@@ -256,7 +257,7 @@ the wrong checkpoint.
 checks in sequence, so any new test must account for state mutated by earlier
 tests. Order-dependence is a standing hazard here.
 
-### Blocker 3 (OPEN): pg-mem does not honor ROLLBACK
+### Blocker 3 (resolved): pg-mem does not honor ROLLBACK
 
 **What happened.** An assertion that stock was rolled back after an aborted
 transaction failed. Probed `pg-mem` in isolation:
@@ -280,7 +281,9 @@ a reason unrelated to our code, with an explanatory comment at
 **Escalation.** This widens Fix 1c: real Postgres is needed not only for the
 concurrency test but to re-verify existing rollback assertions.
 
-**Status: open, awaiting infrastructure decision.**
+**Status: resolved.** Test suite migrated to real Postgres on an isolated
+schema; the rollback assertion this blocked now runs and passes. See Blocker 4
+for the decision, and the closing sections for final counts.
 
 ### Blocker 4 (resolved by decision): choosing a real test database
 
@@ -426,38 +429,6 @@ misleading result.
 
 ---
 
-## Files changed this session (all uncommitted)
-
-```
-src/db/queries.ts        — newId() helper; transaction-scoped reads in both write
-                           methods; guarded status UPDATEs with rowCount aborts;
-                           getShipmentByOrderTx(); payment update scoped to 'captured'
-src/tests/tools.test.ts  — 9 new checks (concurrency guards + ID uniqueness);
-                           pg-mem ROLLBACK limitation documented inline
-docs/handoff.md          — new §5.5 Blockers section; 1a/1b marked done; 1c scope
-                           widened; Fix 2 re-assessed; changelog entry
-docs/claude-code-worklog-extract.md — this section
-```
-
-## Verification performed
-
-- `npm test` → **39/39 passing** (30 pre-existing + 9 new)
-- `npm run build` (tsc + schema copy) → clean, zero errors
-- Direct probes of unfixed code to confirm the bug was real before fixing it
-- Isolated probe of `pg-mem` ROLLBACK semantics to confirm Blocker 3
-
-**Not verified, explicitly:** rollback behavior and true concurrent access — both
-require Fix 1c. No live-Supabase re-verification was run this session, and nothing
-was committed or deployed.
-
-## Incidental observations (not acted on)
-
-- `orders.total_amount` and `payments.amount` are `REAL` in `schema.sql` — float
-  arithmetic on currency. Not raised by the client; flagged for consideration.
-- The local `.env` `DATABASE_URL` points at the **production** Supabase pooler.
-  Any test run or `--reset` that picks up that env var would hit the live demo
-  database. A separate `TEST_DATABASE_URL` is a prerequisite for Fix 1c.
-
 ### Finding: refunds left live inventory reserved (fixed, beyond requested scope)
 
 **How it surfaced.** After Fix 2 landed, the developer asked how serious the
@@ -512,3 +483,66 @@ approval, because it is a genuine hole in the write-path safety model that is th
 project's central claim. The same-key race was left open by the same judgment
 applied in reverse: real but low-likelihood, and it touches error handling three
 consecutive fixes had just stabilised.
+
+
+## Files changed this session
+
+All committed. Six commits on `main`:
+
+```
+d91e6e1  fix: guard concurrent write-tool mutations and eliminate ID collisions
+d13d9b4  test: run against real Postgres and add concurrency suite
+01c8c07  docs: record fixes 1a-1c, blockers hit, and one disclosed gap
+d3a43e3  fix: make rejection-path log failures traceable
+1132e77  fix: refund releases live inventory hold and credits stock
+fcc949d  docs: update README for real-Postgres testing
+```
+
+```
+src/db/queries.ts             — newId() helper; transaction-scoped reads in both
+                                write methods; guarded status UPDATEs with rowCount
+                                aborts; getShipmentByOrderTx(); payment update
+                                scoped to 'captured'; refund releases active holds
+                                and credits stock back
+src/tools/definitions.ts      — issue_refund description states that it releases
+                                inventory, so the agent does not try to do it separately
+src/tests/testdb.ts    (new)  — real-Postgres harness, isolated ops_mcp_test schema
+src/tests/tools.test.ts       — 24 new checks across guards, ID uniqueness, log
+                                observability, and inventory release; migrated off pg-mem
+src/tests/concurrency.test.ts (new) — 18 checks under genuine contention
+package.json                  — pg-mem removed; test:concurrency and test:all scripts
+.env.example                  — TEST_DATABASE_URL / TEST_SCHEMA documented
+README.md                     — real-Postgres test docs; safety guarantees updated
+docs/handoff.md               — restructured as a closing project record (Fix 3)
+docs/conversational-test-suite.md (new) — natural-language prompts for validating
+                                agent behavior through an MCP client
+docs/claude-code-worklog-extract.md — this section
+```
+
+## Verification performed
+
+- `npm test` → **54/54 passing** (30 pre-existing + 24 added this session)
+- `npm run test:concurrency` → **18/18 passing** under genuine simultaneity
+- `npm run build` (tsc + schema copy) → clean, zero errors
+- Direct probes of unfixed code before each fix, to confirm the defect was real
+- Isolated probe of `pg-mem` ROLLBACK semantics (Blocker 3)
+- **Live MCP protocol test** against a locally-run server: `initialize` handshake,
+  `tools/list` returning all 7, read and write `tools/call` round-trips, plus five
+  safety gates over the wire — missing `confirmed_by_operator`, `confirmed_by_operator:
+  false`, non-UUID idempotency key, oversell rejection, and unknown tool name. All
+  behaved correctly. Run against the isolated test schema, not demo data.
+- Live deployment re-checked: `/health` and a DB-backed `tools/call` both responding
+
+**Gap worth naming:** until that MCP protocol test, every automated check in this
+project called tool handlers directly and bypassed HTTP, `McpServer` registration,
+and the transport entirely. The server wiring had never been exercised by the
+suite. It is still not covered by an automated test — the protocol check was
+manual. An end-to-end test through the transport is the obvious next addition.
+
+## Incidental observations (not acted on)
+
+- `orders.total_amount` and `payments.amount` are `REAL` in `schema.sql` — float
+  arithmetic on currency. Not raised by the client; flagged for consideration.
+- Tests default to `DATABASE_URL` when `TEST_DATABASE_URL` is unset. Safe today,
+  because the harness pins every connection to a dedicated schema, but an explicit
+  `TEST_DATABASE_URL` is still the safer habit for anyone running this fresh.
