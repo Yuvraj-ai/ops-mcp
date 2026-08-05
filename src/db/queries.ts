@@ -1,4 +1,17 @@
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
+import { randomUUID } from "crypto";
+
+/**
+ * Collision-free ID generator.
+ *
+ * IDs were previously `${prefix}${Date.now()}`, which collides when two writes
+ * land in the same millisecond — these are TEXT PRIMARY KEYs, so a collision
+ * aborts the transaction with a duplicate-key error.
+ */
+export function newId(prefix: string): string {
+  return `${prefix}${Date.now()}-${randomUUID().slice(0, 8)}`;
+}
+
 
 export interface OrderRow {
   id: string;
@@ -103,47 +116,85 @@ export class OpsRepository {
     return result.rows[0] as ShipmentRow | undefined;
   }
 
+  /**
+   * Same read as getShipmentByOrder, but on a caller-supplied transaction
+   * client so it participates in that transaction's isolation. Never read via
+   * the pool once BEGIN has been issued — a pool read runs on a different
+   * connection, sees none of the transaction's own uncommitted writes, and can
+   * self-deadlock if the pool is saturated.
+   */
+  private async getShipmentByOrderTx(
+    client: PoolClient,
+    orderId: string
+  ): Promise<ShipmentRow | undefined> {
+    const result = await client.query("SELECT * FROM shipments WHERE order_id = $1", [orderId]);
+    return result.rows[0] as ShipmentRow | undefined;
+  }
+
   async reconfirmOrder(
     orderId: string,
     idempotencyKey: string,
     inputJson: string
   ): Promise<{ success: true; new_order_status: string; new_hold_id: string; note: string }> {
-    const order = await this.getOrder(orderId);
-    if (!order) throw new Error(`Order ${orderId} not found`);
-    const hold = await this.getHoldByOrder(orderId);
-    if (!hold) throw new Error(`No inventory hold record found for ${orderId}`);
-
-    const newHoldId = `H${Date.now()}`;
-    const expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
-
     const client = await this.pool.connect();
     try {
-       await client.query("BEGIN");
-       const stockUpdate = await client.query(
-         "UPDATE inventory_stock SET available_qty = available_qty - $1 WHERE sku = $2 AND available_qty >= $1",
-         [hold.quantity, hold.sku]
-       );
-       if (stockUpdate.rowCount === 0) {
-         throw new Error(
-           `Insufficient stock for SKU ${hold.sku}: need ${hold.quantity}, not available`
-         );
-       }
-       await client.query(
-          "INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES ($1, $2, $3, $4, 'active', $5)",
-          [newHoldId, orderId, hold.sku, hold.quantity, expiresAt]
-        );
-        await client.query("UPDATE orders SET status = 'confirmed' WHERE id = $1", [orderId]);
+      await client.query("BEGIN");
 
-        const existingShipment = await this.getShipmentByOrder(orderId);
+      // Every read below runs on the transaction's own client, so the state we
+      // validate is the state we mutate.
+      const orderResult = await client.query("SELECT * FROM orders WHERE id = $1", [orderId]);
+      const order = orderResult.rows[0] as OrderRow | undefined;
+      if (!order) throw new Error(`Order ${orderId} not found`);
+
+      const holdResult = await client.query(
+        "SELECT * FROM inventory_holds WHERE order_id = $1",
+        [orderId]
+      );
+      const hold = holdResult.rows[0] as HoldRow | undefined;
+      if (!hold) throw new Error(`No inventory hold record found for ${orderId}`);
+
+      const newHoldId = newId("H");
+      const expiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+
+      const stockUpdate = await client.query(
+        "UPDATE inventory_stock SET available_qty = available_qty - $1 WHERE sku = $2 AND available_qty >= $1",
+        [hold.quantity, hold.sku]
+      );
+      if (stockUpdate.rowCount === 0) {
+        throw new Error(
+          `Insufficient stock for SKU ${hold.sku}: need ${hold.quantity}, not available`
+        );
+      }
+
+      // Guarded status flip: the WHERE clause re-checks 'failed' at write time,
+      // so a concurrent caller that also read 'failed' but lost the race matches
+      // 0 rows here and aborts instead of creating a second hold.
+      const orderUpdate = await client.query(
+        "UPDATE orders SET status = 'confirmed' WHERE id = $1 AND status = 'failed'",
+        [orderId]
+      );
+      if (orderUpdate.rowCount === 0) {
+        throw new Error(
+          `Order ${orderId} state changed since it was read (status is no longer 'failed'). ` +
+            `No changes were made — please re-investigate before acting.`
+        );
+      }
+
+      await client.query(
+        "INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at) VALUES ($1, $2, $3, $4, 'active', $5)",
+        [newHoldId, orderId, hold.sku, hold.quantity, expiresAt]
+      );
+
+      const existingShipment = await this.getShipmentByOrderTx(client, orderId);
       if (existingShipment) {
         await client.query(
           "UPDATE shipments SET status = 'pending', updated_at = $1 WHERE order_id = $2",
           [new Date().toISOString(), orderId]
         );
-        } else {
+      } else {
         await client.query(
           "INSERT INTO shipments (id, order_id, status, carrier, updated_at) VALUES ($1, $2, 'pending', NULL, $3)",
-          [`S${Date.now()}`, orderId, new Date().toISOString()]
+          [newId("S"), orderId, new Date().toISOString()]
         );
       }
       const result = {
@@ -176,15 +227,37 @@ export class OpsRepository {
     inputJson: string,
     reason: string
   ): Promise<{ success: true; refund_id: string; new_order_status: string; reason: string }> {
-    const payment = await this.getPaymentByOrder(orderId);
-    if (!payment) throw new Error(`No payment record found for ${orderId}`);
-    const refundId = `R${Date.now()}`;
-
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
-      await client.query("UPDATE payments SET status = 'refunded' WHERE order_id = $1", [orderId]);
-      await client.query("UPDATE orders SET status = 'refunded' WHERE id = $1", [orderId]);
+
+      const paymentResult = await client.query(
+        "SELECT * FROM payments WHERE order_id = $1",
+        [orderId]
+      );
+      const payment = paymentResult.rows[0] as PaymentRow | undefined;
+      if (!payment) throw new Error(`No payment record found for ${orderId}`);
+
+      const refundId = newId("R");
+
+      // Guarded: only flip an order that is not already refunded. A concurrent
+      // caller that lost the race matches 0 rows and aborts rather than issuing
+      // a second refund against the same payment.
+      const orderUpdate = await client.query(
+        "UPDATE orders SET status = 'refunded' WHERE id = $1 AND status != 'refunded'",
+        [orderId]
+      );
+      if (orderUpdate.rowCount === 0) {
+        throw new Error(
+          `Order ${orderId} state changed since it was read (it is already 'refunded'). ` +
+            `No refund was issued — please re-investigate before acting.`
+        );
+      }
+
+      await client.query(
+        "UPDATE payments SET status = 'refunded' WHERE order_id = $1 AND status = 'captured'",
+        [orderId]
+      );
       const result = {
         success: true,
         refund_id: refundId,
