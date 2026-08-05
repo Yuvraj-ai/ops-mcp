@@ -6,8 +6,9 @@ verified. It is a finished project history, not a task tracker.
 
 **Status: complete and deployed.** Live at `https://ops-mcp.onrender.com`, backed
 by a hosted Supabase Postgres instance. All client-requested revisions from both
-review rounds are implemented, tested, and committed. One known gap is documented
-and disclosed in Appendix A.6 rather than left to be discovered.
+review rounds are implemented, tested, and committed, along with one defect found
+and fixed beyond that scope. One known gap is documented and disclosed in
+Appendix A.6 rather than left to be discovered.
 
 ---
 
@@ -95,7 +96,7 @@ src/db/queries.ts            — OpsRepository: all SQL, transactions, audit,
 src/tools/definitions.ts     — all 7 MCP tool definitions
 src/server.ts                — Express + MCP SDK wiring, stateless HTTP transport
 src/tests/testdb.ts          — test harness: real Postgres, isolated schema
-src/tests/tools.test.ts      — 48 runtime checks
+src/tests/tools.test.ts      — 54 runtime checks
 src/tests/concurrency.test.ts — 18 concurrent-access checks
 package.json / tsconfig.json / README.md / .gitignore / .env.example
 ```
@@ -104,7 +105,7 @@ package.json / tsconfig.json / README.md / .gitignore / .env.example
 
 | Suite | Command | Result |
 |---|---|---|
-| Tool + safety + audit + idempotency + guards | `npm test` | **48/48** |
+| Tool + safety + audit + idempotency + guards + inventory release | `npm test` | **54/54** |
 | Concurrent access | `npm run test:concurrency` | **18/18** |
 | Compile | `npm run build` | clean, zero errors |
 | Live Supabase end-to-end | manual | 11/11 |
@@ -128,6 +129,7 @@ project.
 - **Transactional rollback genuinely verified** — an aborted guard leaves no partial write (this was unverifiable before the test-database migration; see Appendix A.3)
 - **Concurrency verified under real contention** — two simultaneous `reconfirm_order` calls with different idempotency keys produce exactly one success, one active hold, one stock decrement, one success row in `action_log`, and an actionable error for the loser
 - Safety rejections behave correctly: already-refunded order (A1025), no captured payment (A1026), decoy non-failed order (A1027), unknown order ID → clean error, no crash
+- `issue_refund` releases any live inventory hold and credits the units back to available stock, in the same transaction as the refund — no phantom reservations
 - Rejection-path audit/idempotency failures are non-blocking **and** traceable — tagged log lines naming the tool, order or key, and the operational consequence
 
 **Seed data reference (`src/db/seed.ts`):**
@@ -171,7 +173,7 @@ appear in commit history. A per-session engineering log lives in
 | Tool | Input | Preconditions enforced |
 |---|---|---|
 | `reconfirm_order` | `order_id`, `idempotency_key`, `confirmed_by_operator` | Rejects if order is `refunded`/`cancelled` or status isn't `failed`; atomic conditional stock decrement prevents oversell; **conditional status UPDATE prevents concurrent double-confirmation**; replays stored result on repeat `idempotency_key` |
-| `issue_refund` | `order_id`, `idempotency_key`, `amount`, `reason`, `confirmed_by_operator` | Rejects if already `refunded` or if no `captured` payment exists; **conditional status UPDATE prevents concurrent double-refund**; replays stored result on repeat `idempotency_key` |
+| `issue_refund` | `order_id`, `idempotency_key`, `amount`, `reason`, `confirmed_by_operator` | Rejects if already `refunded` or if no `captured` payment exists; **conditional status UPDATE prevents concurrent double-refund**; **releases any active inventory hold and credits stock back in the same transaction**; replays stored result on repeat `idempotency_key` |
 
 Full description strings (the actual text fed to the calling model) live in
 `src/tools/definitions.ts` — do not summarize or paraphrase these when reasoning
@@ -209,6 +211,7 @@ correct: there is no mutation for them to share atomicity with.
 11. **[Second review] Transaction isolation is a property of the connection, not the code block.** A read issued via the pool from inside a `BEGIN` block does not participate in that transaction, however it reads on the page. Every read inside a transaction now runs on the transaction's own client. This also removes a self-deadlock risk: a transaction holding one connection requesting a second from a saturated pool.
 12. **[Second review] Guard every consequential UPDATE, not just the obvious one.** The stock decrement was already conditional; the order status flip was not. Two concurrent calls with different idempotency keys could both read `failed` and both proceed. The general principle adopted: any `UPDATE` whose correctness depends on state read earlier must re-check that state in its own `WHERE` clause and treat 0 affected rows as an abort.
 13. **[Second review] Test against the real engine, not an imitation of it.** `pg-mem` was found to accept `BEGIN`/`ROLLBACK` without honoring the rollback, and has no row-level locking. A file-backed SQLite alternative was proposed and declined for the same class of reason — its database-level write lock cannot reproduce the READ COMMITTED semantics the guards depend on. Tests now run against real Postgres in an isolated schema. Full reasoning in Appendix A.3.
+14. **A refund must release what the order was holding.** Refunding money and freeing the reservation that money was paying for are one operation, not two. `issue_refund` originally did the first and not the second, which meant a refund on an order with a live hold left the units reserved permanently. The general principle: a write tool that ends an order's lifecycle is responsible for every resource that order had claimed, and must do it in the same transaction — otherwise a partial failure leaves the two halves disagreeing.
 
 ---
 
@@ -365,10 +368,34 @@ not.
 
 Non-blocking behavior was left unchanged and is now asserted rather than assumed.
 
-### A.6 — Known gap: same-key idempotency under a true race
+### A.6 — Two gaps found while probing the refund path
 
-**Found by the new concurrency suite, not requested.** Two `reconfirm_order` calls
-with the **same** `idempotency_key`, fired simultaneously:
+While assessing whether the same-key race could mislead an operator into taking a
+contradictory action, the probe exposed a separate and more consequential defect.
+
+**Gap 1 — refunding an order that holds live inventory left the reservation
+standing. FIXED.** Not a race: a plain precondition gap. `issue_refund` checked
+only "not already refunded" and "payment captured", both true of a `confirmed` or
+`shipped` order. Refunding one left its active hold in place and its stock
+decrement permanent, with no shipment ever coming.
+
+```
+order_now=confirmed              (reconfirm succeeded)
+refund_on_confirmed=success      (refund also succeeded)
+final_status=refunded  active_holds=1  stock=11
+```
+
+Money returned, unit reserved forever. That is state corruption rather than a
+violated contract, it does not self-heal, and it needed no race — any operator
+could reach it at any time. `issueRefund` now releases any `status = 'active'`
+hold on the order and credits the freed units back to `available_qty`, in the
+same transaction as the refund. Scoped to active holds specifically, so a refund
+against an already-released or expired hold cannot double-credit stock. 6 new
+checks; main suite **54/54**.
+
+**Gap 2 — same-key idempotency does not replay under genuinely simultaneous
+calls. NOT FIXED, by decision.** Two `reconfirm_order` calls with the **same**
+`idempotency_key`, fired simultaneously:
 
 ```
 RESULT_1: {"success":true,"new_hold_id":"H1785938590195-16fa0599",...}
@@ -387,16 +414,26 @@ for genuinely simultaneous same-key calls: neither request sees the other's
 uncommitted idempotency row, so the loser falls through to the conditional-write
 guard and receives a state-changed error instead of a replay.
 
-**Not fixed, deliberately.** The fix — catch the unique-violation on the
-`idempotency_keys` INSERT, re-read, return the stored result — changes write-path
-error handling that fixes 1a/1b had just stabilised, and warrants its own review
-cycle rather than being folded in at the end of a session. It is asserted and
-commented in `src/tests/concurrency.test.ts` so it cannot regress silently.
+**Why the two gaps are connected.** Gap 2's misleading error was the plausible
+route into Gap 1: a caller told "state changed" might conclude the reconfirm
+failed and issue a refund, which before the fix would have succeeded and
+corrupted inventory state. With Gap 1 fixed that chain terminates safely — the
+worst outcome is a refund on an order that had in fact succeeded, which is money
+out but inventory correctly returned, and is visible in `action_log`.
 
-**Assessment:** low practical impact, since an LLM agent retries sequentially
-rather than in parallel. Disclosed here rather than left to be found — the same
-posture that had the 1a shipment-read issue disclosed before the client
-independently confirmed it.
+**Why Gap 2 is left open.** The fix — catch the unique-violation on the
+`idempotency_keys` INSERT, re-read, and return the stored result — is well
+understood and Postgres makes it reliable (the loser blocks until the winner
+commits, so the stored row is guaranteed readable by the time the error is
+raised). It is deferred because it changes write-path error handling that three
+consecutive fixes had just stabilised, and it deserves its own review cycle
+rather than being folded in at the end of a session. It is asserted and commented
+in `src/tests/concurrency.test.ts` so it cannot regress silently.
+
+**Assessment:** low likelihood — an LLM agent retries sequentially, not in
+parallel — and the corruption path it could have led to is now closed. Disclosed
+here rather than left to be found, the same posture that had the 1a shipment-read
+issue disclosed before the client independently confirmed it.
 
 ---
 
@@ -411,4 +448,5 @@ independently confirmed it.
 - **[2026-08-01] Seed reset preserves audit history.** Excluded `action_log` from the `--reset` truncation. The audit trail is durable by design; `idempotency_keys` remains in scope, being orphaned once its mutations are gone.
 - **[2026-08-05] Concurrent write guards + ID collisions** (`d91e6e1`). Transaction-scoped reads in both write methods; conditional status UPDATEs aborting on 0 affected rows; `newId()` replacing millisecond-based IDs. The two-holds-on-one-order defect was reproduced before being fixed, and the ID collision was found to be masking it (Appendix A.1).
 - **[2026-08-05] Real-Postgres test infrastructure + concurrency suite** (`d13d9b4`). `pg-mem` removed after being found not to honor `ROLLBACK`. Tests moved to an isolated `ops_mcp_test` schema on real Postgres. New 18-check concurrency suite verifying the guards under genuine contention. Restored the rollback assertion that had been unverifiable; fixed a `COUNT(*)` assertion that had been passing on `pg-mem`'s non-standard typing (A.3, A.4).
+- **[2026-08-05] Refund releases live inventory.** `issue_refund` now releases any `status = 'active'` hold on the order and credits the freed units back to `available_qty`, inside the refund's own transaction. Found while probing whether the same-key race could mislead an operator: refunding a `confirmed` or `shipped` order previously left its reservation standing and its stock decrement permanent, with no shipment coming — phantom inventory reachable by any operator, no race required. Beyond the client's requested scope; fixed because it is a genuine hole in the safety model the project rests on. 6 new checks, main suite 54/54. See Appendix A.6.
 - **[2026-08-05] Rejection-path log traceability** (`d3a43e3`). Tagged, identified log lines stating operational consequence. The reported "silent swallowing" did not exist; the real defect was untraceability (A.5).

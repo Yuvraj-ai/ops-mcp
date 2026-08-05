@@ -351,6 +351,98 @@ async function run() {
     /550e8400-e29b-41d4-a716-446655440099/.test(idemLogLine)
   );
 
+  // === Refund on an order holding live inventory ===
+  //
+  // Not a race condition — a standalone precondition gap. issue_refund only
+  // checked "not already refunded" and "payment captured", both true of an
+  // order that still holds an ACTIVE reservation. Refunding one left the hold
+  // in place and its stock decrement standing, with no shipment ever coming:
+  // phantom reserved inventory that does not self-heal.
+  //
+  // Money is refunded either way; the requirement is that the reservation the
+  // order was holding is released in the same transaction.
+  //
+  // Every seeded order with an active hold (A1004, A1027) is consumed by
+  // earlier checks, so this sets up its own order rather than depending on
+  // seed state that earlier tests have already mutated.
+  console.log("\n== Refund releases live inventory ==");
+
+  await pool.query(
+    `INSERT INTO orders (id, customer_name, status, total_amount, sku, created_at)
+     VALUES ('A1099', 'Inventory Release Test', 'confirmed', 1500, 'SKU-505', $1)`,
+    [new Date().toISOString()]
+  );
+  await pool.query(
+    `INSERT INTO payments (id, order_id, status, amount, captured_at)
+     VALUES ('P1099', 'A1099', 'captured', 1500, $1)`,
+    [new Date().toISOString()]
+  );
+  await pool.query(
+    `INSERT INTO inventory_holds (id, order_id, sku, quantity, status, expires_at)
+     VALUES ('H1099', 'A1099', 'SKU-505', 1, 'active', $1)`,
+    [new Date(Date.now() + 30 * 60_000).toISOString()]
+  );
+
+  const invHoldBefore = await pool.query(
+    "SELECT status FROM inventory_holds WHERE order_id = $1 AND status = 'active'",
+    ["A1099"]
+  );
+  check("test order holds an active reservation before the refund", invHoldBefore.rows.length === 1);
+
+  const invStockBefore = (await byName.check_stock_availability.handler({
+    sku: "SKU-505",
+    quantity: 1,
+  })) as any;
+
+  const invRefund = (await byName.issue_refund.handler({
+    order_id: "A1099",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440055",
+    amount: 1500,
+    reason: "refund an order that still holds stock",
+    confirmed_by_operator: true,
+  })) as any;
+  check("refund succeeds (money is returned)", invRefund.success === true);
+
+  const invOrderAfter = (await byName.get_order_details.handler({ order_id: "A1099" })) as any;
+  check("order is now 'refunded'", invOrderAfter.status === "refunded");
+
+  const invHoldAfter = await pool.query(
+    "SELECT status FROM inventory_holds WHERE order_id = $1 AND status = 'active'",
+    ["A1099"]
+  );
+  check("refund released the active hold (no phantom reservation)", invHoldAfter.rows.length === 0);
+
+  const invStockAfter = (await byName.check_stock_availability.handler({
+    sku: "SKU-505",
+    quantity: 1,
+  })) as any;
+  check(
+    "refund returned the reserved unit to available stock",
+    invStockAfter.available_qty === invStockBefore.available_qty + 1
+  );
+
+  // A1025 is already refunded and its hold long released — a rejected refund
+  // must not credit stock for a reservation that isn't live.
+  const relStockBefore = (await byName.check_stock_availability.handler({
+    sku: "SKU-303",
+    quantity: 1,
+  })) as any;
+  await byName.issue_refund.handler({
+    order_id: "A1025",
+    idempotency_key: "550e8400-e29b-41d4-a716-446655440056",
+    amount: 999,
+    reason: "already refunded, should reject",
+    confirmed_by_operator: true,
+  });
+  const relStockAfter = (await byName.check_stock_availability.handler({
+    sku: "SKU-303",
+    quantity: 1,
+  })) as any;
+  check(
+    "rejected refund does not credit stock",
+    relStockAfter.available_qty === relStockBefore.available_qty
+  );
+
   console.log(`\n${passed} passed, ${failed} failed\n`);
   await pool.end();
   if (failed > 0) process.exit(1);

@@ -274,6 +274,27 @@ export class OpsRepository {
         "UPDATE payments SET status = 'refunded' WHERE order_id = $1 AND status = 'captured'",
         [orderId]
       );
+
+      // Release any live reservation this order still holds, and return the
+      // units to available stock. Without this, refunding an order that had an
+      // active hold left the reservation standing and the stock decrement
+      // permanent, with no shipment ever coming — phantom reserved inventory
+      // that does not self-heal.
+      //
+      // Scoped to status = 'active' so the credit happens once and only for a
+      // genuinely live reservation: an already-released or expired hold has no
+      // outstanding stock claim to give back. Both statements share this
+      // transaction, so a failure anywhere rolls back the refund with them.
+      const releasedHolds = await client.query(
+        "UPDATE inventory_holds SET status = 'released' WHERE order_id = $1 AND status = 'active' RETURNING sku, quantity",
+        [orderId]
+      );
+      for (const hold of releasedHolds.rows as Array<{ sku: string; quantity: number }>) {
+        await client.query(
+          "UPDATE inventory_stock SET available_qty = available_qty + $1 WHERE sku = $2",
+          [hold.quantity, hold.sku]
+        );
+      }
       const result = {
         success: true,
         refund_id: refundId,

@@ -457,3 +457,58 @@ was committed or deployed.
 - The local `.env` `DATABASE_URL` points at the **production** Supabase pooler.
   Any test run or `--reset` that picks up that env var would hit the live demo
   database. A separate `TEST_DATABASE_URL` is a prerequisite for Fix 1c.
+
+### Finding: refunds left live inventory reserved (fixed, beyond requested scope)
+
+**How it surfaced.** After Fix 2 landed, the developer asked how serious the
+same-key idempotency gap actually was. Rather than assert a severity, I probed the
+harm chain: if a caller wrongly believes a reconfirm failed, what can they then
+do? The probe answered a different and worse question.
+
+```
+order_now=confirmed              (reconfirm succeeded)
+refund_on_confirmed=success      (refund also succeeded)
+final_status=refunded  active_holds=1  stock=11
+```
+
+`issue_refund` checked only "not already refunded" and "payment captured" — both
+true of a `confirmed` or `shipped` order. So refunding one succeeded and left its
+active hold in place with the stock decrement permanent, and no shipment ever
+coming. Phantom reserved inventory that does not self-heal.
+
+**Reassessment.** My earlier write-up called the idempotency gap "low practical
+impact" because "data integrity holds." That was true *within* a single call and
+misleading across two. The guard prevents double-confirmation; it does nothing
+about an operator taking a contradictory second action based on a misleading
+error. Corrected in handoff.md A.6.
+
+**Separating the two defects.** The probe initially conflated them. The refund
+gap needs no race at all — any operator can reach it at any time — which makes it
+both more likely and more damaging than the race that led me to it. Worth stating
+plainly, since the race was the thing under discussion and the incidental finding
+turned out to matter more.
+
+**Fix.** `issueRefund` releases any `status = 'active'` hold on the order and
+credits the freed units back to `available_qty`, in the refund's own transaction.
+Scoped to active holds so an already-released or expired hold cannot
+double-credit. Deliberately narrow: it does not change which orders may be
+refunded, only that a refund cleans up after itself.
+
+**Test-authorship friction, recorded because it recurred.** Three attempts:
+- A1004 — already refunded by the idempotency test earlier in the suite.
+- A1002 — probe showed its seeded hold is `released`, not `active`; my assumption
+  about the seed data was wrong, and the test would have verified nothing.
+- Dedicated `A1099` inserted by the test itself — every seeded order with an
+  active hold (A1004, A1027) is consumed by earlier checks.
+
+This suite shares one database across sequential checks, so any new test either
+picks an untouched fixture or creates its own. Two of the three attempts failed on
+a wrong assumption about state rather than on the code under test — the same
+pattern as the earlier fake-passing assertions. Verified the seed data directly
+before settling on the third approach instead of guessing a fourth time.
+
+**Scope judgment.** Outside what the client asked for. Fixed anyway, with
+approval, because it is a genuine hole in the write-path safety model that is the
+project's central claim. The same-key race was left open by the same judgment
+applied in reverse: real but low-likelihood, and it touches error handling three
+consecutive fixes had just stabilised.

@@ -170,9 +170,12 @@ export function buildToolDefinitions(repo: OpsRepository) {
         "money-affecting and irreversible in this system. ONLY call this after the operations " +
         "user has explicitly approved THIS SPECIFIC refund in the current conversation. Only " +
         "call with confirmed_by_operator=true once that approval is given. This tool will " +
-        "reject orders that are already refunded. Generate a fresh UUID for idempotency_key " +
-        "per logical attempt. If you retry after a timeout or error, reuse the SAME key " +
-        "verbatim - the server will replay the stored result instead of re-executing.",
+        "reject orders that are already refunded. If the order still holds an active inventory " +
+        "reservation, that hold is released and the units are returned to available stock as " +
+        "part of the same refund - you do not need to release it separately. Generate a fresh " +
+        "UUID for idempotency_key per logical attempt. If you retry after a timeout or error, " +
+        "reuse the SAME key verbatim - the server will replay the stored result instead of " +
+        "re-executing.",
       inputSchema: {
         order_id: z.string(),
         idempotency_key: z
