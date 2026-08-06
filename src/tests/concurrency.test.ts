@@ -117,10 +117,12 @@ async function run() {
 
   // === Scenario A: same idempotency key, fired together ===
   //
-  // Here replay is the intended mechanism. Note this exercises a genuine race in
-  // the replay path itself: both calls may miss the idempotency row on their
-  // initial read, in which case the composite PK on (tool_name, key) is the
-  // backstop that prevents a second mutation from committing.
+  // The contract is "retry with the same key replays the stored result". This
+  // asserts it holds under genuine simultaneity, not just for sequential
+  // retries. The serialization point is a pg_advisory_xact_lock keyed on
+  // tool_name + idempotency_key, taken as the first statement in the
+  // transaction: the second caller blocks there until the first commits, then
+  // finds the committed idempotency row and replays it.
   console.log("\n== Scenario A: concurrent reconfirm, SAME idempotency key ==");
 
   await resetTestSchema(pool);
@@ -147,28 +149,29 @@ async function run() {
   const successesA = resultsA.filter((r: any) => r.success === true);
   const errorsA = resultsA.filter((r: any) => r.error);
 
-  // Data integrity is the hard requirement and it holds: one mutation only.
-  check("same-key concurrency produced exactly one successful mutation", successesA.length === 1);
-
-  // KNOWN GAP (documented, not yet fixed): under a TRUE same-key race — both
-  // calls in flight before either commits — neither sees the other's
-  // idempotency row on its initial read, so the loser falls through to the Fix
-  // 1b guard and receives a state-changed ERROR rather than a replay of the
-  // stored result. The client's stated idempotency contract is "retry with the
-  // same key replays the stored result", which holds for sequential retries
-  // (the normal case: timeout, then retry) but not for genuinely simultaneous
-  // same-key calls. Nothing is double-executed; the caller just gets a
-  // less-helpful response than the contract promises.
-  //
-  // Proper fix would be to catch the unique-violation on the idempotency INSERT
-  // and re-read the stored result to return it. Recorded in handoff.md §5.5.4.
   if (errorsA.length > 0) {
-    console.log(`        NOTE: same-key loser returned an error, not a replay:`);
+    console.log(`        loser returned an error instead of a replay:`);
     console.log(`        ${(errorsA[0] as any).error}`);
   }
+
+  // Both callers must get the stored result back. One-success-one-error is the
+  // exact failure this fix closes.
+  check("both same-key calls returned success (true replay, no error)", successesA.length === 2);
+  check("neither same-key call returned an error", errorsA.length === 0);
+
+  // The strongest available proof that the second call REPLAYED rather than
+  // re-executed: newId() makes every hold ID unique, so two real executions
+  // cannot produce the same new_hold_id. Identical results therefore mean one
+  // execution and one replay of its stored output — this assertion cannot pass
+  // by coincidence the way a bare count can.
   check(
-    "same-key loser did not double-execute (error or replay, never a second mutation)",
-    successesA.length === 1
+    "both calls returned byte-identical results (same stored result replayed)",
+    JSON.stringify(resultsA[0]) === JSON.stringify(resultsA[1])
+  );
+  check(
+    "the replayed result carries the same new_hold_id (not a second execution)",
+    (resultsA[0] as any).new_hold_id !== undefined &&
+      (resultsA[0] as any).new_hold_id === (resultsA[1] as any).new_hold_id
   );
 
   const holdCountA = await countRows(
@@ -177,6 +180,16 @@ async function run() {
     ["A1023"]
   );
   check("exactly one active hold after same-key concurrency", holdCountA === 1);
+
+  // The hold that exists in the DB must be the one both callers were told about.
+  const holdIdA = await pool.query(
+    "SELECT id FROM inventory_holds WHERE order_id = $1 AND status = 'active'",
+    ["A1023"]
+  );
+  check(
+    "the single hold in the DB is the one both callers were given",
+    holdIdA.rows[0]?.id === (resultsA[0] as any).new_hold_id
+  );
 
   const stockAfterA = (await byName.check_stock_availability.handler({
     sku: "SKU-202",
@@ -194,12 +207,61 @@ async function run() {
   );
   check("idempotency key stored exactly once", idemRows === 1);
 
+  const orderAfterA = (await byName.get_order_details.handler({ order_id: "A1023" })) as any;
+  check("order ended in 'confirmed' under same-key concurrency", orderAfterA.status === "confirmed");
+
+  // Two rows, deliberately: one for the mutation (written inside the write
+  // transaction) and one for the replay. Both calls really happened, so an
+  // audit log that recorded only one would be under-reporting.
   const successAuditsA = await countRows(
     pool,
     "SELECT COUNT(*)::int as count FROM action_log WHERE order_id = $1 AND tool_name = 'reconfirm_order' AND success = true",
     ["A1023"]
   );
-  check("at most one success audit row under same-key concurrency", successAuditsA <= 1);
+  check("audit log records both the mutation and the replay", successAuditsA === 2);
+
+  // === Scenario A2: same idempotency key on the money path ===
+  console.log("\n== Scenario A2: concurrent refund, SAME idempotency key ==");
+
+  await resetTestSchema(pool);
+
+  const sharedRefundKey = "dddddddd-1111-4111-8111-dddddddddddd";
+  const resultsA2 = await Promise.all([
+    byName.issue_refund.handler({
+      order_id: "A1024",
+      idempotency_key: sharedRefundKey,
+      amount: 1799,
+      reason: "same-key concurrent refund",
+      confirmed_by_operator: true,
+    }),
+    byName.issue_refund.handler({
+      order_id: "A1024",
+      idempotency_key: sharedRefundKey,
+      amount: 1799,
+      reason: "same-key concurrent refund",
+      confirmed_by_operator: true,
+    }),
+  ]);
+
+  const successesA2 = resultsA2.filter((r: any) => r.success === true);
+  const errorsA2 = resultsA2.filter((r: any) => r.error);
+  if (errorsA2.length > 0) {
+    console.log(`        refund loser said: ${(errorsA2[0] as any).error}`);
+  }
+  check("both same-key refunds returned success (true replay)", successesA2.length === 2);
+  check("neither same-key refund returned an error", errorsA2.length === 0);
+  check(
+    "both refunds returned the same refund_id (one execution, one replay)",
+    (resultsA2[0] as any).refund_id !== undefined &&
+      (resultsA2[0] as any).refund_id === (resultsA2[1] as any).refund_id
+  );
+
+  const refundIdemRows = await countRows(
+    pool,
+    "SELECT COUNT(*)::int as count FROM idempotency_keys WHERE tool_name = 'issue_refund' AND key = $1",
+    [sharedRefundKey]
+  );
+  check("refund idempotency key stored exactly once", refundIdemRows === 1);
 
   // === Concurrent refund, different keys (money path) ===
   console.log("\n== Concurrent refund, DIFFERENT idempotency keys ==");

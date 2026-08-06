@@ -134,7 +134,12 @@ export function buildToolDefinitions(repo: OpsRepository) {
                 error: `Order ${input.order_id} has status '${order.status}', not 'failed'. Re-investigate before acting.`,
               };
             } else {
-              result = await repo.reconfirmOrder(input.order_id, input.idempotency_key, JSON.stringify(input));
+              const outcome = await repo.reconfirmOrder(input.order_id, input.idempotency_key, JSON.stringify(input));
+              result = outcome.result;
+              // A same-key caller that raced this one and lost the advisory
+              // lock gets the stored result back rather than an error. Mark it
+              // as a replay so it is audited like any other replay.
+              isReplay = outcome.replayed;
             }
           } catch (err) {
             result = { error: err instanceof Error ? err.message : String(err) };
@@ -220,7 +225,9 @@ export function buildToolDefinitions(repo: OpsRepository) {
                   error: `Order ${input.order_id} has no captured payment to refund (payment status: ${payment?.status ?? "none"}).`,
                 };
               } else {
-                result = await repo.issueRefund(input.order_id, input.idempotency_key, JSON.stringify(input), input.reason);
+                const outcome = await repo.issueRefund(input.order_id, input.idempotency_key, JSON.stringify(input), input.reason);
+                result = outcome.result;
+                isReplay = outcome.replayed;
               }
             }
           } catch (err) {

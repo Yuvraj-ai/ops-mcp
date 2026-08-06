@@ -12,6 +12,18 @@ export function newId(prefix: string): string {
   return `${prefix}${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
+/**
+ * What a write tool did: either it mutated and produced `result`, or it found a
+ * committed result for this idempotency key and replayed it verbatim.
+ *
+ * The caller needs the distinction only for auditing — the `result` handed back
+ * is byte-identical either way, which is the whole point of the contract.
+ */
+export interface WriteOutcome<T> {
+  replayed: boolean;
+  result: T;
+}
+
 
 export interface OrderRow {
   id: string;
@@ -147,14 +159,72 @@ export class OpsRepository {
     return result.rows[0] as ShipmentRow | undefined;
   }
 
+  /**
+   * Serialize callers sharing an idempotency key, for the life of this
+   * transaction.
+   *
+   * Without this, two genuinely simultaneous same-key calls both miss the
+   * idempotency row — neither transaction can see the other's uncommitted
+   * INSERT — so the loser falls through to the order-status guard and gets a
+   * "state changed" error instead of the replay the contract promises. Taking
+   * the lock as the FIRST statement in the transaction makes the second caller
+   * wait here until the first commits or rolls back, after which it reads the
+   * now-committed row and replays it.
+   *
+   * Must be called before any read whose result the transaction acts on,
+   * otherwise the lock closes no window.
+   *
+   * `pg_advisory_xact_lock` is released automatically at COMMIT or ROLLBACK, so
+   * the abort path cannot leak it. `hashtext()` is 32-bit, so two unrelated
+   * keys can hash to the same value and briefly serialize; that costs a little
+   * concurrency and never correctness, since the lock only orders callers and
+   * every guard downstream still re-checks its own precondition.
+   */
+  private async lockIdempotencyKey(
+    client: PoolClient,
+    toolName: string,
+    key: string
+  ): Promise<void> {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${toolName}:${key}`]);
+  }
+
+  /**
+   * Read a stored idempotency result on the transaction's own client, so it
+   * sees rows committed while this transaction waited on the advisory lock.
+   */
+  private async getIdempotencyResultTx(
+    client: PoolClient,
+    toolName: string,
+    key: string
+  ): Promise<any | undefined> {
+    const result = await client.query(
+      "SELECT result FROM idempotency_keys WHERE tool_name = $1 AND key = $2",
+      [toolName, key]
+    );
+    if (result.rows.length === 0) return undefined;
+    return JSON.parse(result.rows[0].result);
+  }
+
   async reconfirmOrder(
     orderId: string,
     idempotencyKey: string,
     inputJson: string
-  ): Promise<{ success: true; new_order_status: string; new_hold_id: string; note: string }> {
+  ): Promise<WriteOutcome<{ success: true; new_order_status: string; new_hold_id: string; note: string }>> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+
+      // First statement in the transaction: hold the gate before reading any
+      // state we intend to act on. A simultaneous same-key caller blocks here.
+      await this.lockIdempotencyKey(client, "reconfirm_order", idempotencyKey);
+
+      // Now that we hold the gate, a same-key call that committed while we
+      // waited is visible. Replay it instead of re-executing.
+      const stored = await this.getIdempotencyResultTx(client, "reconfirm_order", idempotencyKey);
+      if (stored !== undefined) {
+        await client.query("COMMIT");
+        return { replayed: true, result: stored };
+      }
 
       // Every read below runs on the transaction's own client, so the state we
       // validate is the state we mutate.
@@ -228,7 +298,7 @@ export class OpsRepository {
         ["reconfirm_order", idempotencyKey, JSON.stringify(result)]
       );
       await client.query("COMMIT");
-      return result;
+      return { replayed: false, result };
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
@@ -242,10 +312,22 @@ export class OpsRepository {
     idempotencyKey: string,
     inputJson: string,
     reason: string
-  ): Promise<{ success: true; refund_id: string; new_order_status: string; reason: string }> {
+  ): Promise<WriteOutcome<{ success: true; refund_id: string; new_order_status: string; reason: string }>> {
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+
+      // Same gate as reconfirmOrder, for the same reason — see
+      // lockIdempotencyKey. Money path, so the replay contract matters more
+      // here, not less: a caller that retries must never be told the refund
+      // failed when it actually succeeded.
+      await this.lockIdempotencyKey(client, "issue_refund", idempotencyKey);
+
+      const stored = await this.getIdempotencyResultTx(client, "issue_refund", idempotencyKey);
+      if (stored !== undefined) {
+        await client.query("COMMIT");
+        return { replayed: true, result: stored };
+      }
 
       const paymentResult = await client.query(
         "SELECT * FROM payments WHERE order_id = $1",
@@ -310,7 +392,7 @@ export class OpsRepository {
         ["issue_refund", idempotencyKey, JSON.stringify(result)]
       );
       await client.query("COMMIT");
-      return result;
+      return { replayed: false, result };
     } catch (err) {
       await client.query("ROLLBACK");
       throw err;
