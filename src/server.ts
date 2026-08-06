@@ -40,8 +40,12 @@ app.post("/mcp", async (req, res) => {
     const server = buildMcpServer();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
-      transport.close();
-      server.close();
+      // Both return promises. This callback is synchronous, so an unhandled
+      // rejection here would surface as a process-level unhandledRejection —
+      // which Node terminates on by default. Swallow deliberately: cleanup
+      // failure on an already-finished response is not worth a crash.
+      void Promise.resolve(transport.close()).catch(() => {});
+      void Promise.resolve(server.close()).catch(() => {});
     });
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
@@ -55,6 +59,27 @@ app.post("/mcp", async (req, res) => {
       });
     }
   }
+});
+
+// The MCP Streamable HTTP spec has clients probe GET /mcp to open an optional
+// server->client SSE stream, and DELETE /mcp to end a session. This server is
+// stateless and offers neither, but "no such route" and "route exists, method
+// not offered" are different answers and clients act on the difference: the
+// official SDK client treats 405 as "no SSE stream, carry on" and throws a
+// StreamableHTTPError on any other status. Falling through to Express's
+// default 404 therefore made every SDK client emit a transport error on
+// connect. 405 with an Allow header is the correct, spec-compliant answer.
+app.all("/mcp", (req, res) => {
+  if (req.method === "POST") return; // handled above
+  res.setHeader("Allow", "POST");
+  res.status(405).json({
+    jsonrpc: "2.0",
+    error: {
+      code: -32000,
+      message: `Method Not Allowed: this server is stateless and only supports POST /mcp. ${req.method} is not offered.`,
+    },
+    id: null,
+  });
 });
 
 app.get("/health", (_req, res) => {
