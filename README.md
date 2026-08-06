@@ -88,7 +88,9 @@ set once a human has approved the specific action):
 - **Explicit operator approval** — both write tools require `confirmed_by_operator: true`,
   set only after a human approves the specific action.
 - **Idempotent replay** — both write tools require an agent-generated UUID `idempotency_key`.
-  Retrying with the same key replays the stored result instead of re-executing.
+  Retrying with the same key replays the stored result instead of re-executing — including
+  when two calls carrying that key arrive at genuinely the same instant, which a
+  transaction-scoped advisory lock on the key serializes.
 - **Transactional audit + idempotency** — the `action_log` row and `idempotency_keys` row are
   committed in the same transaction as the mutation; they commit or roll back together.
 - **Oversell protection** — stock decrement is a single atomic conditional
@@ -153,9 +155,23 @@ harness drops and recreates on every run:
 ```
 npm test                  # 54 checks: tools, safety rejections, audit,
                           # idempotency, concurrency guards, inventory release
-npm run test:concurrency  # 18 checks: genuinely simultaneous write attempts
+npm run test:concurrency  # 26 checks: genuinely simultaneous write attempts,
+                          # including same-key replay under real contention
 npm run test:all          # both suites
 ```
+
+Both suites call the tool handlers directly, so neither crosses the wire. For
+protocol-level coverage — Express routing, `McpServer` registration, and the
+Streamable HTTP transport — run the smoke script against a live server:
+
+```
+node scripts/mcp-smoke.mjs                                   # localhost:3000
+node scripts/mcp-smoke.mjs https://ops-mcp.onrender.com/mcp  # deployed
+```
+
+It uses the official MCP SDK client, so it fails on what a real client would
+trip over. Read-only — it never calls a write tool, so it is safe against a
+live deployment.
 
 Set `TEST_DATABASE_URL` to point at a Postgres instance; if unset, tests fall
 back to `DATABASE_URL`. Either way the harness pins its connections to a

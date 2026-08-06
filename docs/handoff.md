@@ -97,7 +97,9 @@ src/tools/definitions.ts     — all 7 MCP tool definitions
 src/server.ts                — Express + MCP SDK wiring, stateless HTTP transport
 src/tests/testdb.ts          — test harness: real Postgres, isolated schema
 src/tests/tools.test.ts      — 54 runtime checks
-src/tests/concurrency.test.ts — 18 concurrent-access checks
+src/tests/concurrency.test.ts — 26 concurrent-access checks
+scripts/mcp-smoke.mjs        — read-only MCP protocol check over real HTTP,
+                                using the official SDK client (local or prod)
 package.json / tsconfig.json / README.md / .gitignore / .env.example
 ```
 
@@ -106,9 +108,9 @@ package.json / tsconfig.json / README.md / .gitignore / .env.example
 | Suite | Command | Result |
 |---|---|---|
 | Tool + safety + audit + idempotency + guards + inventory release | `npm test` | **54/54** |
-| Concurrent access | `npm run test:concurrency` | **18/18** |
+| Concurrent access, incl. same-key replay | `npm run test:concurrency` | **26/26** |
+| MCP protocol over HTTP | `node scripts/mcp-smoke.mjs <url>` | **13/13** |
 | Compile | `npm run build` | clean, zero errors |
-| Live Supabase end-to-end | manual | 11/11 |
 
 Tests run against **real PostgreSQL**, in a dedicated `ops_mcp_test` schema that
 the harness drops and recreates per run. Demo data in the `public` schema is
@@ -127,6 +129,8 @@ project.
 - Sequential retry with the same `idempotency_key` replays the stored result instead of re-executing
 - Oversell rejected by atomic conditional stock decrement (0 rows → rollback), verified against A1024 (SKU-101 at 0)
 - **Transactional rollback genuinely verified** — an aborted guard leaves no partial write (this was unverifiable before the test-database migration; see Appendix A.3)
+- **Simultaneous same-key calls both replay the stored result** — verified under real contention, and verified load-bearing by negative control (Appendix A.7)
+- **MCP protocol conformance over real HTTP** — `initialize`, `tools/list`, `tools/call`, and the write-tool approval gate, exercised with the official SDK client rather than hand-built JSON (Appendix A.8)
 - **Concurrency verified under real contention** — two simultaneous `reconfirm_order` calls with different idempotency keys produce exactly one success, one active hold, one stock decrement, one success row in `action_log`, and an actionable error for the loser
 - Safety rejections behave correctly: already-refunded order (A1025), no captured payment (A1026), decoy non-failed order (A1027), unknown order ID → clean error, no crash
 - `issue_refund` releases any live inventory hold and credits the units back to available stock, in the same transaction as the refund — no phantom reservations
@@ -182,17 +186,27 @@ source of behavior changes.
 
 ### Write-path safety model
 
-Four independent layers, each covering what the one above it cannot:
+Five independent layers, each covering what the one above it cannot:
 
 1. **Operator approval** — `confirmed_by_operator: true` must be set explicitly.
 2. **State preconditions** — the handler rejects orders in states where the action makes no sense, with an explanatory message the agent can relay.
 3. **Idempotency** — an agent-generated UUID; a repeat key replays the stored result rather than re-executing.
-4. **Conditional writes** — every consequential `UPDATE` re-checks its precondition in the `WHERE` clause at write time; 0 affected rows aborts the transaction. This is what holds when two requests race, since layers 2 and 3 both read state that can move before the write lands.
+4. **Same-key serialization** — a transaction-scoped advisory lock keyed on `tool_name + idempotency_key`, taken as the first statement of the write transaction. Layer 3 alone cannot serve two *simultaneous* callers, because neither transaction can see the other's uncommitted idempotency row; the lock makes the second wait for the first to commit, so it reads a real answer rather than racing past it.
+5. **Conditional writes** — every consequential `UPDATE` re-checks its precondition in the `WHERE` clause at write time; 0 affected rows aborts the transaction. This is what holds when two requests race with *different* keys, where replay cannot intercept at all.
+
+Layers 4 and 5 answer different questions and neither substitutes for the other.
+Same key means "you already have an answer, here it is." Different keys mean
+"two distinct intentions arrived at once, only one can be right." The advisory
+lock only orders callers; every guard downstream still re-checks its own
+precondition, so a lock-hash collision between unrelated keys costs a little
+concurrency and never correctness.
 
 The audit row and idempotency row for a successful mutation commit **inside the
 same transaction** as the mutation itself — they cannot disagree with what
 actually happened. Rejection-path audit rows are standalone inserts, which is
-correct: there is no mutation for them to share atomicity with.
+correct: there is no mutation for them to share atomicity with. A replay is
+audited too, so the log shows both the call that mutated and the call that
+replayed rather than silently under-reporting one of them.
 
 ---
 
@@ -212,6 +226,9 @@ correct: there is no mutation for them to share atomicity with.
 12. **[Second review] Guard every consequential UPDATE, not just the obvious one.** The stock decrement was already conditional; the order status flip was not. Two concurrent calls with different idempotency keys could both read `failed` and both proceed. The general principle adopted: any `UPDATE` whose correctness depends on state read earlier must re-check that state in its own `WHERE` clause and treat 0 affected rows as an abort.
 13. **[Second review] Test against the real engine, not an imitation of it.** `pg-mem` was found to accept `BEGIN`/`ROLLBACK` without honoring the rollback, and has no row-level locking. A file-backed SQLite alternative was proposed and declined for the same class of reason — its database-level write lock cannot reproduce the READ COMMITTED semantics the guards depend on. Tests now run against real Postgres in an isolated schema. Full reasoning in Appendix A.3.
 14. **A refund must release what the order was holding.** Refunding money and freeing the reservation that money was paying for are one operation, not two. `issue_refund` originally did the first and not the second, which meant a refund on an order with a live hold left the units reserved permanently. The general principle: a write tool that ends an order's lifecycle is responsible for every resource that order had claimed, and must do it in the same transaction — otherwise a partial failure leaves the two halves disagreeing.
+15. **[Third review] Close the same-key race with a lock, not with error handling.** Two options were considered for making simultaneous same-key calls replay. (a) Catch the unique-violation on the idempotency `INSERT`, then re-read and return the stored result — this was the approach sketched when the gap was first disclosed. It works, but only *after* the loser has already executed the whole mutation and been rolled back: wasted work, and it relies on correctly distinguishing that specific constraint violation from every other error the transaction can raise. (b) **Chosen:** `pg_advisory_xact_lock(hashtext(tool_name || key))` as the first statement of the transaction. The loser never starts the mutation at all — it waits, then finds a committed row and replays. Serialization happens before the work rather than being unwound after it, and the mechanism is one line whose failure mode is "waits too long," bounded by `statement_timeout`. Transaction-scoped, so `ROLLBACK` releases it and the abort path cannot leak a lock.
+16. **[Third review] "Route not found" and "method not offered" are different answers, and clients act on the difference.** Only `POST /mcp` was routed, so the spec's optional `GET` (SSE stream) and `DELETE` (session termination) fell through to Express's default 404 with an HTML body. The official MCP SDK client special-cases exactly **405** as "no SSE stream offered, carry on" and throws `StreamableHTTPError` on every other status — so a 404 turned an expected negotiation step into a transport error for every SDK-based client. The general principle: on a protocol endpoint, the status code *is* the interface. Returning a technically-true-but-wrong code is a protocol bug even when the happy path still works.
+17. **[Third review] An unbounded wait is worse than a failure.** The `pg` pool left `connectionTimeoutMillis`, `statement_timeout`, and `query_timeout` at their defaults, all of which mean "wait forever." Under those settings a database that is merely slow does not produce an error — it produces a request that never completes and never logs, which is the least debuggable outcome available and exactly the reported symptom. All three are now bounded well above normal query time, so a fault surfaces fast and loggably. Chosen deliberately over raising the ceiling: the goal is not to tolerate a slow database, it is to find out about one.
 
 ---
 
@@ -243,7 +260,21 @@ Appendix A.1.
 
 **Found and disclosed, not requested:** same-key idempotency does not replay under
 genuinely simultaneous calls. Data integrity holds; the stated contract does not,
-for that case. Appendix A.6.
+for that case. Appendix A.6. **Closed in round three.**
+
+### Round three — the same-key gap, and a reported production failure
+
+| Requested | Outcome |
+|---|---|
+| Close the same-key concurrent replay gap for real, not by documenting it | `pg_advisory_xact_lock(hashtext(tool:key))` as the first statement of both write transactions, followed by an in-transaction idempotency re-read. Both simultaneous callers now receive the identical stored result. Concurrency suite 18 → 26 checks |
+| Debug a client report that the hosted endpoint did not complete an MCP request | **No outage found, and no evidence the server was ever down.** One real defect found that produces exactly this class of symptom (`GET /mcp` → 404 instead of 405, which makes every official-SDK client raise a transport error on connect) and one latent mechanism for a request to hang forever (unbounded database waits). Both fixed. Whether either is what the client hit is **not confirmed** — see Appendix A.8 for what was and was not established |
+
+**Found, not requested:** production's demo state had been fully consumed —
+A1023 already `confirmed`, A1024 already `refunded`. Any walkthrough of the
+documented demo script would have hit correct-but-confusing rejections
+("has status 'confirmed', not 'failed'"). This is worth ruling in or out before
+concluding anything about server health; a demo that looks broken and a server
+that is broken are different problems. Fix is `npm run seed -- --reset`.
 
 ---
 
@@ -435,6 +466,145 @@ parallel — and the corruption path it could have led to is now closed. Disclos
 here rather than left to be found, the same posture that had the 1a shipment-read
 issue disclosed before the client independently confirmed it.
 
+> **Closed in round three (A.7).** The client asked for this to be fixed rather
+> than carried. The deferral reasoning above stands as written — it was the right
+> call for that session — but the eventual fix was *not* the unique-violation
+> approach sketched here. Serializing before the work turned out to be simpler
+> and cheaper than unwinding it after. Left in place because the rejected option
+> is part of the record.
+
+### A.7 — Closing the same-key race, and proving the fix was load-bearing
+
+The gap in A.6: two calls with the same idempotency key, genuinely simultaneous,
+both miss the idempotency row — neither transaction can see the other's
+uncommitted `INSERT` — so the loser falls through to the order-status guard and
+gets `state changed since it was read` instead of the replay the contract
+promises.
+
+The fix is one statement, placed first in both write transactions:
+
+```sql
+SELECT pg_advisory_xact_lock(hashtext($1))   -- $1 = 'reconfirm_order:<uuid>'
+```
+
+followed by re-reading `idempotency_keys` **on the transaction's own client**.
+The second caller blocks on the lock, and by the time it proceeds the first has
+committed, so the re-read finds the stored result and returns it verbatim.
+Position matters: the lock must precede any read the transaction acts on, or it
+closes no window. This is the same lesson as Decisions Log #11 — isolation is a
+property of the connection — applied to a lock instead of a read.
+
+**Why the test could not be trusted until it was attacked.** A.1 is the reason:
+in the previous session an assertion passed against unfixed code because ID
+collisions were raising a duplicate-key error that looked like the guard firing.
+Four assertions were green for the wrong reason. So this fix was verified three
+ways rather than one:
+
+1. **Red first.** The 8 new assertions were run against the unfixed code and
+   failed, with the loser reporting the exact documented error
+   (`Order A1024 state changed since it was read (it is already 'refunded')`).
+   A test that has never failed proves nothing.
+2. **Proof of replay, not of counting.** The strong assertion is that both calls
+   return a **byte-identical result with the same `new_hold_id`**. Because
+   `newId()` (A.1) makes every hold ID unique, two genuine executions *cannot*
+   produce the same ID — so identical results mean one execution and one replay.
+   A bare "exactly one hold exists" count would have passed under the old
+   behavior too, which is precisely the trap A.1 fell into.
+3. **Negative control.** The lock key was temporarily made unique per call, so
+   the lock stayed in place but could never contend, with every other line of
+   the fix untouched. The identical 8 assertions failed again. That establishes
+   the lock — not the surrounding refactor — is what carries the behavior, and
+   that the test genuinely exercises simultaneity rather than accidentally
+   serializing.
+
+`pg_advisory_xact_lock` is released at `COMMIT` or `ROLLBACK`, so the abort path
+cannot leak it. `hashtext()` is 32-bit, so two unrelated keys can collide and
+serialize briefly; that costs a little concurrency and never correctness, since
+the lock only orders callers and every guard downstream still re-checks its own
+precondition.
+
+Different-key concurrency is untouched — all 9 Scenario B checks pass unchanged,
+which was the explicit requirement. Suite: 18 → 26 checks.
+
+### A.8 — A reported production failure with no outage behind it
+
+The client reported that the hosted endpoint did not complete an MCP request.
+No specifics were available — not which call, not what the failure looked like.
+
+**What was established, by measurement:**
+
+| Check | Result |
+|---|---|
+| `/health` | 200 in 0.163 s — warm, not a cold start |
+| `initialize` over HTTPS | 200 in 0.162 s, protocol negotiated |
+| `tools/call` hitting Postgres | 200 in 1.05 s, real rows |
+| 20 parallel `tools/call` | 20/20 succeeded, ~1.1 s each, no degradation |
+| Deployed version | serving `1132e77` or later — all session code is live |
+| Build | compiles clean |
+| Protocol version negotiation | correct for 2024-11-05 through 2025-11-25 |
+| 12 mid-flight client aborts against a local server | process survived all 12 |
+
+`/health` is worth calling out: it returns a **static list built at startup and
+never touches the database**, so a 200 from it proves the process is alive and
+nothing more. It cannot be used to conclude the server is healthy. The DB-backed
+`tools/call` above is what actually establishes connectivity.
+
+**What could not be established.** There is no Render API key or CLI on this
+machine, so **the build/deploy history and the runtime logs were not readable**.
+Crash-looping and OOM kills therefore could not be ruled out directly — only
+indirectly, via consistent uptime across every probe. The deploy question was
+answered a different way, by fingerprinting the live `tools/list` output against
+a tool description that changed in `1132e77`.
+
+**One real defect found, which produces this exact class of symptom.** The MCP
+Streamable HTTP spec has clients probe `GET /mcp` to open an optional
+server→client SSE stream. Only `POST` was routed, so `GET` and `DELETE` fell
+through to Express's default 404 with an HTML body. Reading the official SDK
+client's transport source:
+
+```js
+// 405 indicates that the server does not offer an SSE stream at GET endpoint
+// This is an expected case that should not trigger an error
+if (response.status === 405) { return; }
+throw new StreamableHTTPError(response.status, `Failed to open SSE stream: ...`);
+```
+
+405 is handled gracefully; **everything else throws**. Confirmed by running the
+reference client against production, which raised
+`StreamableHTTPError: Failed to open SSE stream` twice per session. Fixed by
+returning 405 with an `Allow: POST` header. After the fix the same client
+connects silently.
+
+**One latent mechanism for a request to hang forever.** The `pg` pool left
+`connectionTimeoutMillis` (default: wait forever), `statement_timeout` (default:
+off) and `query_timeout` (default: off) unset. Under those defaults a database
+that is slow or briefly unreachable produces no error and no log line — it
+produces a request that never completes. That is a precise match for "did not
+complete an MCP request," but it could not be triggered on demand, so it is a
+plausible mechanism and **not** a confirmed cause. Now bounded.
+
+**A third possibility, unrelated to server health.** Production's demo state was
+fully consumed — A1023 already `confirmed`, A1024 already `refunded`. A client
+walking the documented demo would get *correct* rejections that read like
+failures. Cheap to rule out and worth ruling out first.
+
+**Honest conclusion: the root cause was not determined.** The server was not
+down during this investigation and shows no evidence of having been down. Three
+candidate explanations were found, two of them fixed and one a state issue; none
+can be confirmed as *the* failure without knowing which call the client made and
+what they saw. Presenting the 405 bug as the confirmed answer would be a guess
+wearing a fix's clothing — it is a real defect that breaks real clients, and it
+may well be what happened, but "I found a bug that could cause this" is not the
+same claim as "I found the cause."
+
+**What the investigation exposed about the test strategy.** Both suites call
+tool handlers directly and never cross the wire, so nothing covered Express
+routing, `McpServer` registration, or the transport — which is precisely the
+layer the 405 bug lived in. The previous session disclosed this gap; this one
+hit it. `scripts/mcp-smoke.mjs` now closes it: a read-only protocol check using
+the official SDK client, runnable against local or production. Local 13/13;
+production 9/13 before deploy, failing exactly the four 405-related checks.
+
 ---
 
 ## 8. Project History
@@ -450,3 +620,5 @@ issue disclosed before the client independently confirmed it.
 - **[2026-08-05] Real-Postgres test infrastructure + concurrency suite** (`d13d9b4`). `pg-mem` removed after being found not to honor `ROLLBACK`. Tests moved to an isolated `ops_mcp_test` schema on real Postgres. New 18-check concurrency suite verifying the guards under genuine contention. Restored the rollback assertion that had been unverifiable; fixed a `COUNT(*)` assertion that had been passing on `pg-mem`'s non-standard typing (A.3, A.4).
 - **[2026-08-05] Refund releases live inventory.** `issue_refund` now releases any `status = 'active'` hold on the order and credits the freed units back to `available_qty`, inside the refund's own transaction. Found while probing whether the same-key race could mislead an operator: refunding a `confirmed` or `shipped` order previously left its reservation standing and its stock decrement permanent, with no shipment coming — phantom inventory reachable by any operator, no race required. Beyond the client's requested scope; fixed because it is a genuine hole in the safety model the project rests on. 6 new checks, main suite 54/54. See Appendix A.6.
 - **[2026-08-05] Rejection-path log traceability** (`d3a43e3`). Tagged, identified log lines stating operational consequence. The reported "silent swallowing" did not exist; the real defect was untraceability (A.5).
+- **[2026-08-07] Same-key concurrent replay closed** (`03c86b9`). `pg_advisory_xact_lock(hashtext(tool:key))` as the first statement of both write transactions, plus an in-transaction idempotency re-read. Simultaneous same-key callers now both receive the identical stored result instead of the loser getting a state-changed error. Verified red-first, proven by byte-identical results rather than row counts, and confirmed load-bearing by a negative control that made the lock non-contending and reproduced the identical failures. Different-key behavior unchanged. Concurrency suite 18 → 26 (A.7).
+- **[2026-08-07] Protocol conformance and bounded database waits** (`1fb1d16`). Investigating a client report of a failed request found no outage and no evidence of one. Two real defects were found and fixed: `GET`/`DELETE /mcp` returned Express's default 404 instead of the spec's 405, which makes every official-SDK client raise a transport error on connect (reproduced against production with the reference client); and the `pg` pool left connection, statement, and query timeouts at their wait-forever defaults, so a slow database would hang a request with no error and no log. Cleanup promises in `res.on("close")` also gained a `.catch()`. **The client's root cause was not determined** — see A.8 for the boundary between what was measured and what remains unknown. Adds `scripts/mcp-smoke.mjs`, closing the previously-disclosed gap that no automated check crossed the wire.

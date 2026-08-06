@@ -249,10 +249,19 @@ behaviors are meant to be induced by the descriptions in
 
 ---
 
-## Known limitation to be aware of
+## Before you run this
 
-Two write calls fired at genuinely the same instant with the **same** idempotency
-key will return an error to the loser rather than replaying the stored result.
-Data stays correct — one mutation, one hold, one audit row. This is not reachable
-through normal conversation, since an agent retries sequentially. Documented in
-`docs/handoff.md` Appendix A.6.
+Reset the demo state first. Prompts 1.1–1.4 and Section 5 assume A1023 and
+A1024 are both `failed`; once they've been run, they stay consumed, and a
+second pass gets *correct* rejections ("has status 'confirmed', not 'failed'")
+that read like the server is broken when it isn't.
+
+```bash
+npm run seed -- --reset
+```
+
+## Closed limitation
+
+Simultaneous same-key write calls used to return an error to the loser instead
+of replaying the stored result. Fixed 2026-08-07: both callers now receive the
+identical stored result. See `docs/handoff.md` Appendix A.7.

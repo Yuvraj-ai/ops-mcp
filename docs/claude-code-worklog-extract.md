@@ -546,3 +546,225 @@ manual. An end-to-end test through the transport is the obvious next addition.
 - Tests default to `DATABASE_URL` when `TEST_DATABASE_URL` is unset. Safe today,
   because the harness pins every connection to a dedicated schema, but an explicit
   `TEST_DATABASE_URL` is still the safer habit for anyone running this fresh.
+
+---
+
+# Session 3 — 2026-08-07 (Claude Opus, Claude Code CLI)
+
+Two items: a reported production failure to debug, and the same-key idempotency
+gap that session 2 disclosed and deferred, which the client asked to have closed
+rather than carried.
+
+## Process decision: skills invoked and skipped
+
+- **`systematic-debugging` — invoked.** The client framed item 1 as "find the
+  actual root cause with evidence, don't guess-and-patch." That is the skill's
+  exact remit, and the discipline earned its keep: the first two hypotheses I
+  formed were both wrong, and the process caught both before either became a fix.
+- **TDD — applied to item 2.** Red first, then green, then a negative control.
+  Non-negotiable here given Blocker 1 of session 2 (a test that passed against
+  unfixed code).
+
+## Item 1 — the reported production failure
+
+### What the report was
+
+"The hosted MCP endpoint did not complete an MCP request during their check."
+No specifics: not which call, not what the failure looked like, not when.
+
+### Hypotheses formed and killed
+
+Recording these because the dead ends are the useful part — three plausible
+theories were refuted by measurement before the real defect surfaced.
+
+**H1: Render's `DATABASE_URL` still held the pre-rotation password.** Session 2
+ended with this flagged as unverified, and it fit the symptom beautifully:
+`/health` returns a **static list built at startup and never touches the
+database**, so it would keep returning 200 while every tool call failed. Killed
+by calling a DB-backed tool against production — it returned real rows in 1.05 s.
+
+**H2: The unawaited `close()` calls crash the process.** `res.on("close")` called
+`transport.close()` and `server.close()`, both `async`, from a synchronous
+callback with no `await` and no `.catch()`. An unhandled rejection there
+terminates the process in Node ≥15, and `res.on("close")` fires on client
+disconnect — so a client timeout could take the server down and every in-flight
+request with it. A tidy story. Killed by testing it: 12 mid-flight aborts against
+a local server, from 1 ms to 500 ms, and the process survived all 12. The
+promises don't reject on that path. Hardened anyway, but demoted from cause to
+latent risk.
+
+**H3: Connection pool saturation.** Killed by firing 20 parallel `tools/call` at
+production: 20/20 succeeded at ~1.1 s each, no degradation.
+
+### The defect that was real
+
+The MCP Streamable HTTP spec has clients probe `GET /mcp` to open an optional
+server→client SSE stream. `src/server.ts` routed only `POST`, so `GET` and
+`DELETE` fell through to Express's default 404 with an **HTML** body. Reading the
+official SDK client's transport source settled it:
+
+```js
+// 405 indicates that the server does not offer an SSE stream at GET endpoint
+// This is an expected case that should not trigger an error
+if (response.status === 405) { return; }
+throw new StreamableHTTPError(response.status, `Failed to open SSE stream: ...`);
+```
+
+405 is the one status handled gracefully. Everything else throws. Confirmed
+empirically by running the reference client against production, which raised
+`StreamableHTTPError: Failed to open SSE stream` twice per session.
+
+The general lesson, recorded as Decisions Log #16: on a protocol endpoint the
+status code *is* the interface. "Route not found" and "method not offered" are
+different answers and clients branch on the difference. A technically-true-but-
+wrong status is a protocol bug even when the happy path still works.
+
+### The second thing found
+
+The `pg` pool left `connectionTimeoutMillis`, `statement_timeout`, and
+`query_timeout` at their defaults — all of which mean *wait forever*. Under those
+settings a database that is merely slow produces no error and no log line; it
+produces a request that never completes. That is an exact match for the reported
+symptom, but it could not be triggered on demand, so it is a **plausible
+mechanism, not a confirmed cause**. Bounded now, deliberately at a level that
+only fires on a genuine fault (Decisions Log #17).
+
+### The third thing, which isn't a server problem at all
+
+Production's demo state was fully consumed — A1023 already `confirmed`, A1024
+already `refunded`. Anyone walking the documented demo script would hit *correct*
+rejections ("has status 'confirmed', not 'failed'") that read exactly like a
+broken server. Cheap to check, and worth checking before concluding anything
+about server health.
+
+### Blocker: no Render access
+
+**No `RENDER_API_KEY`, no `render` CLI, no `render.yaml`.** Build logs, deploy
+history, and runtime logs were all unreadable. This blocks direct answers on
+crash-looping and OOM kills; they could only be argued against indirectly, from
+consistent uptime across every probe.
+
+The deploy question was answered a different way — by fingerprinting the live
+`tools/list` output against a tool description string that changed in `1132e77`.
+It is present, so all session-2 code is live and this is not a failed build
+silently serving an older commit. Worth keeping as a technique: **the tool
+descriptions are a version fingerprint reachable without any dashboard access.**
+
+### Honest conclusion
+
+**The root cause was not determined.** The server was not down during this
+investigation and shows no evidence of having been down. Three candidate
+explanations were found — two fixed, one a state issue — and none can be
+confirmed as *the* failure without knowing which call was made and what was seen.
+The 405 bug is real and breaks real clients, and it may well be what happened,
+but "I found a bug that could cause this" is a different claim from "I found the
+cause," and collapsing the two would be a guess wearing a fix's clothing.
+
+## Item 2 — closing the same-key replay gap
+
+Session 2 disclosed this and deferred it, sketching a fix: catch the
+unique-violation on the `idempotency_keys` INSERT, re-read, return the stored
+result. **That is not the fix that landed**, and the reasoning is worth keeping.
+
+That approach only engages *after* the loser has executed the entire mutation and
+been rolled back — wasted work — and it depends on correctly distinguishing one
+constraint violation from every other error the transaction can raise. The
+alternative serializes *before* the work:
+
+```sql
+SELECT pg_advisory_xact_lock(hashtext($1))   -- 'reconfirm_order:<uuid>'
+```
+
+as the first statement of the transaction, followed by re-reading
+`idempotency_keys` on the transaction's own client. The second caller blocks;
+by the time it proceeds the first has committed; the re-read finds the stored
+result and returns it verbatim. Nothing to unwind. Position is load-bearing — the
+lock must precede any read the transaction acts on, which is Decisions Log #11
+(isolation belongs to the connection) applied to a lock instead of a read.
+
+### Verification, deliberately three-layered
+
+Session 2's Blocker 1 is the reason one layer wasn't enough:
+
+1. **Red first.** The 8 new assertions were run against unfixed code and failed,
+   with the loser reporting the exact documented error (`Order A1024 state
+   changed since it was read (it is already 'refunded')`).
+2. **Proof of replay rather than of counting.** The strong assertion is that both
+   calls return a **byte-identical result carrying the same `new_hold_id`**.
+   Because `newId()` makes every hold ID unique, two genuine executions cannot
+   produce the same ID — so identical results mean one execution and one replay.
+   A bare "exactly one hold exists" count would have passed under the *old*
+   behavior too, which is precisely the trap Blocker 1 fell into.
+3. **Negative control.** The lock key was made unique per call — lock still
+   present, but never contending, every other line untouched. The identical 8
+   assertions failed again. That is what establishes the lock is carrying the
+   behavior and that the test genuinely exercises simultaneity rather than
+   accidentally serializing.
+
+### A test of mine that was wrong
+
+The first run of the new protocol smoke script reported `write tool rejects a
+call missing confirmed_by_operator` as FAIL. The server was correct — SDK 1.30
+surfaces a tool-level rejection as `isError: true` on the result rather than
+throwing, and my assertion expected a throw. Checked the raw wire response before
+touching anything: the rejection was there and correct
+(`-32602 ... Invalid literal value, expected true at confirmed_by_operator`).
+Fixed the assertion, not the server. Worth logging as the mirror image of
+Blocker 1 — a test failing for the wrong reason is the same class of error as one
+passing for the wrong reason.
+
+## Files changed this session
+
+```
+src/db/queries.ts             — advisory lock + in-transaction idempotency
+                                 re-read in both write methods; WriteOutcome
+                                 return type
+src/tools/definitions.ts      — unwrap WriteOutcome, audit concurrent replays
+                                 identically to sequential ones
+src/tests/concurrency.test.ts — Scenario A rewritten to assert true replay;
+                                 new Scenario A2 for the refund path (18 -> 26)
+src/server.ts                 — 405 + Allow: POST for GET/DELETE /mcp;
+                                 .catch() on cleanup promises
+src/db/schema.ts              — bounded pool: max, connectionTimeoutMillis,
+                                 idleTimeoutMillis, statement_timeout,
+                                 query_timeout, keepAlive
+scripts/mcp-smoke.mjs (new)   — read-only MCP protocol check over real HTTP
+                                 using the official SDK client
+docs/handoff.md               — Decisions #15-17, Round three, A.7, A.8
+docs/conversational-test-suite.md — limitation closed; reset-first warning
+README.md                     — advisory lock, 26 checks, smoke script
+```
+
+Commits: `03c86b9` (idempotency), `1fb1d16` (protocol + pool).
+
+## Verification performed
+
+- `npm test` → **54/54**
+- `npm run test:concurrency` → **26/26** (was 18 plus a disclosed gap)
+- Negative control → the same 8 assertions fail, confirming the lock is
+  load-bearing and the race is genuine
+- `npx tsc --noEmit` → clean
+- `node scripts/mcp-smoke.mjs` → **13/13** local (post-fix);
+  **9/13** production (pre-deploy), failing exactly the four 405-related checks
+- Official SDK client against production before the fix: two
+  `StreamableHTTPError` transport errors per session. Against the patched
+  server: none.
+
+## Closing the gap session 2 named
+
+Session 2 ended by flagging that every automated check called tool handlers
+directly and "the server wiring had never been exercised by the suite... It is
+still not covered by an automated test." That gap is exactly where the 405 bug
+was living. `scripts/mcp-smoke.mjs` closes it — the official SDK client over real
+HTTP, read-only so it is safe to point at production, and it is what found the
+bug in the first place.
+
+## Still open
+
+- **Deploy required.** `03c86b9` and `1fb1d16` are committed but the production
+  405 fix is not live until pushed and redeployed. `scripts/mcp-smoke.mjs`
+  against the deployed URL is the check that it landed: it should go 9/13 → 13/13.
+- **Production demo state is consumed** — `npm run seed -- --reset` before any
+  further client testing or recording.
+- **Render root cause remains undetermined**, and will stay that way without
+  either the client's specifics or dashboard access to build and runtime logs.
