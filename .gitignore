@@ -2,6 +2,5 @@ node_modules/
 dist/
 *.log
 .env
-*.pdf
 gen-pdf.js
 worklog.html
